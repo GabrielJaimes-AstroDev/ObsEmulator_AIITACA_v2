@@ -43,7 +43,7 @@ except Exception:
 DEFAULT_MERGED_H5 = ""
 DEFAULT_NOISE_NN_H5 = ""
 DEFAULT_FILTER_FILE = ""
-DEFAULT_GDRIVE_MODELS_LINK = "https://drive.google.com/drive/folders/1rkSAT8Dp5Zo5HM6S2VMeAPPRYw4asz1v?usp=sharing"
+DEFAULT_GDRIVE_MODELS_LINK = "https://drive.google.com/drive/folders/1Zm3UpfWfXfa-Uh1sc1HBH3o25qYvqMNH?usp=drive_link"
 
 DEFAULT_TARGET_FREQS = [
 	84.299,
@@ -1249,6 +1249,8 @@ def run_cube_worker(cfg_path: str) -> int:
 						noise_cnt[:, idx] += 1.0
 					except Exception:
 						continue
+			if not np.any(noise_cnt > 0):
+				raise RuntimeError("No overlapping noise ROI segments for this guide frequency")
 			y_noise_valid = np.zeros((n_valid, nchan), dtype=np.float32)
 			m = noise_cnt > 0
 			y_noise_valid[m] = (noise_sum[m] / noise_cnt[m]).astype(np.float32)
@@ -1656,6 +1658,10 @@ def _ensure_state():
 		st.session_state.p6_cube2_last_run_target_freqs = []
 	if "p6_cube_last_run_target_freqs" not in st.session_state:
 		st.session_state.p6_cube_last_run_target_freqs = []
+	if "p6_cube_download_cache" not in st.session_state:
+		st.session_state.p6_cube_download_cache = []
+	if "p6_cube_download_selected" not in st.session_state:
+		st.session_state.p6_cube_download_selected = ""
 
 
 def _is_running() -> bool:
@@ -1999,7 +2005,8 @@ A remarkable upsurge in the complexity of molecules identified in the interstell
 		target_freqs = parse_freq_list(target_text)
 		if not target_freqs:
 			target_freqs = [float(v) for v in DEFAULT_TARGET_FREQS]
-		allow_nearest = st.checkbox("Allow nearest ROI if no overlap", value=bool(DEFAULT_ALLOW_NEAREST))
+		allow_nearest = False
+		st.caption("ROI selection mode for cube generation: exact overlap only (nearest disabled).")
 		noise_scale = st.number_input("Noise scale", min_value=0.0, value=float(DEFAULT_NOISE_SCALE), step=0.1, format="%.3f")
 
 	tab_cube, tab_cube2 = st.tabs(["Cube Generator", "Simulate Single Spectrum"])
@@ -2125,8 +2132,11 @@ A remarkable upsurge in the complexity of molecules identified in the interstell
 			st.rerun()
 
 		guide_freqs_run = _normalize_target_freqs_for_run(parse_freq_list(str(st.session_state.get("p6_guide_freqs_main_input", ""))))
-		target_freqs_cube = guide_freqs_run if guide_freqs_run else _normalize_target_freqs_for_run([float(v) for v in target_freqs])
-		st.caption("Target frequencies used for Cube Generator: " + _freqs_to_text(target_freqs_cube))
+		target_freqs_cube = [float(v) for v in guide_freqs_run]
+		if target_freqs_cube:
+			st.caption("Target frequencies used for Cube Generator: " + _freqs_to_text(target_freqs_cube))
+		else:
+			st.caption("Target frequencies used for Cube Generator: (empty)")
 
 		default_out = DEFAULT_OUTPUT_DIR
 		cube_out_dir = st.text_input("Output directory", value=default_out)
@@ -2163,9 +2173,7 @@ A remarkable upsurge in the complexity of molecules identified in the interstell
 		if start_cube:
 			target_freqs_cube_run = _normalize_target_freqs_for_run(parse_freq_list(str(st.session_state.get("p6_guide_freqs_main_input", ""))))
 			if not target_freqs_cube_run:
-				target_freqs_cube_run = _normalize_target_freqs_for_run([float(v) for v in target_freqs])
-			if not target_freqs_cube_run:
-				st.error("Add at least one target frequency.")
+				st.error("Guide frequencies está vacío. Agrega al menos una frecuencia o usa 'Add selected ROI combination to Guide frequencies'.")
 			elif not os.path.isfile(filter_file):
 				st.error(f"Filter file not found: {filter_file}")
 			elif (not signal_models_root) or ((not os.path.isfile(signal_models_root)) and (not os.path.isdir(signal_models_root))):
@@ -2332,47 +2340,53 @@ A remarkable upsurge in the complexity of molecules identified in the interstell
 			with sp2:
 				pix_x = st.number_input("Spectrum pixel X", min_value=0, value=0, step=1, key="p6_spec_pixel_x")
 
-		if latest_final and os.path.isfile(latest_final):
-			new_mtime = float(os.path.getmtime(latest_final))
-			if (
-				st.session_state.get("cube_last_spectrum_data", None) is None
-				or st.session_state.get("cube_last_final_fits", "") != latest_final
-				or int(st.session_state.get("cube_last_spectrum_data", {}).get("pix_y", -1)) != int(pix_y)
-				or int(st.session_state.get("cube_last_spectrum_data", {}).get("pix_x", -1)) != int(pix_x)
-				or new_mtime > float(st.session_state.get("cube_last_final_mtime", 0.0))
-			):
-				freq, y_syn, y_noise, y_final, err = _extract_pixel_spectra(latest_final, ypix=int(pix_y), xpix=int(pix_x))
-				if err is None:
-					st.session_state.cube_last_spectrum_data = {
-						"freq": freq,
-						"y_syn": y_syn,
-						"y_noise": y_noise,
-						"y_final": y_final,
-						"cube_name": os.path.basename(latest_final),
-						"pix_y": int(pix_y),
-						"pix_x": int(pix_x),
-					}
-					st.session_state.cube_last_final_fits = latest_final
-					st.session_state.cube_last_final_mtime = new_mtime
-
-		spec_data = st.session_state.get("cube_last_spectrum_data", None)
-		if spec_data is not None:
-			st.markdown(f"**Spectrum preview — {spec_data.get('cube_name', 'latest cube')} | pixel (y={int(spec_data.get('pix_y', 0))}, x={int(spec_data.get('pix_x', 0))})**")
-			_plot_spectrum(spec_data.get("freq"), spec_data.get("y_syn"), spec_data.get("y_noise"), spec_data.get("y_final"), chart_key="p6_spec_plot_cube")
+		plot_cubes_main = list(final_cubes_main) if final_cubes_main else list(final_cubes_all_main)
+		if plot_cubes_main:
+			st.markdown(f"**Final spectra grid by target frequency | pixel (y={int(pix_y)}, x={int(pix_x)})**")
+			n_cols_main = 2 if len(plot_cubes_main) <= 4 else 3
+			cols_main = st.columns(n_cols_main)
+			for i_pc, pc_path in enumerate(plot_cubes_main):
+				freq_pc, y_syn_pc, y_noise_pc, y_final_pc, err_pc = _extract_pixel_spectra(pc_path, ypix=int(pix_y), xpix=int(pix_x))
+				with cols_main[i_pc % n_cols_main]:
+					st.caption(os.path.basename(pc_path))
+					if err_pc is None:
+						plot_key_pc = f"p6_spec_plot_cube_{os.path.basename(pc_path)}_{int(os.path.getmtime(pc_path))}_{int(pix_y)}_{int(pix_x)}"
+						_plot_spectrum(freq_pc, y_syn_pc, y_noise_pc, y_final_pc, chart_key=plot_key_pc)
+					else:
+						st.error(f"Could not read spectrum: {err_pc}")
 
 		st.markdown("**Download generated cube**")
-		cubes_for_download = list(final_cubes_main)
-		if not cubes_for_download:
-			cubes_for_download = _find_all_final_main_cubes(cube_out_dir)
-		if cubes_for_download:
+		cubes_for_download_now = _find_all_final_main_cubes(cube_out_dir)
+		cached_cubes = [
+			str(p) for p in st.session_state.get("p6_cube_download_cache", [])
+			if isinstance(p, str) and os.path.isfile(str(p))
+		]
+		merged_download = []
+		seen_download = set()
+		for p in list(cubes_for_download_now) + list(cached_cubes):
+			sp = str(p)
+			if (not sp) or (sp in seen_download) or (not os.path.isfile(sp)):
+				continue
+			seen_download.add(sp)
+			merged_download.append(sp)
+		st.session_state.p6_cube_download_cache = list(merged_download)
+
+		if merged_download:
+			prev_sel = str(st.session_state.get("p6_cube_download_selected", "")).strip()
+			if prev_sel in merged_download:
+				default_idx = int(merged_download.index(prev_sel))
+			else:
+				default_idx = int(max(0, len(merged_download) - 1))
 			sel_cube_dl = st.selectbox(
 				"Select cube",
-				options=cubes_for_download,
+				options=merged_download,
+				index=default_idx,
 				format_func=lambda p: os.path.basename(str(p)),
 				key="p6_cube_download_select",
 			)
+			st.session_state.p6_cube_download_selected = str(sel_cube_dl)
 			try:
-				with open(sel_cube_dl, "rb") as f_in:
+				with open(str(sel_cube_dl), "rb") as f_in:
 					cube_bytes = f_in.read()
 				st.download_button(
 					"Download selected cube (.fits)",
