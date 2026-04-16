@@ -43,12 +43,11 @@ except Exception:
 DEFAULT_MERGED_H5 = ""
 DEFAULT_NOISE_NN_H5 = ""
 DEFAULT_FILTER_FILE = ""
-DEFAULT_GDRIVE_MODELS_LINK = "https://drive.google.com/drive/folders/1wsCOZ4G32ZO5fdzGI8YR_0Qp3ej7m5oC?usp=drive_link"
+DEFAULT_GDRIVE_MODELS_LINK = "https://drive.google.com/drive/folders/1rkSAT8Dp5Zo5HM6S2VMeAPPRYw4asz1v?usp=sharing"
 
 DEFAULT_TARGET_FREQS = [
 	84.299,
-	85.152,
-	110.840000,
+	110.855,
 ]
 
 DEFAULT_ALLOW_NEAREST = True
@@ -1184,6 +1183,38 @@ def run_cube_worker(cfg_path: str) -> int:
 				selected_model_name=selected_model_name,
 				allow_nearest=allow_nearest,
 			)
+
+			target_tag = f"{float(target_freq):.6f}"
+			y_syn_channels: List[np.ndarray] = []
+			kept_freqs: List[float] = []
+			for _, fch, model_refs in roi_entries:
+				pred_acc = np.zeros((n_valid,), dtype=np.float64)
+				pred_cnt = 0
+				for model_name, ref in model_refs:
+					cache_key = f"{model_name}|{ref}"
+					try:
+						if cache_key not in signal_pkg_cache:
+							if is_h5_signal:
+								signal_pkg_cache[cache_key] = load_joblib_package_from_h5(signal_models_source, ref)
+							else:
+								signal_pkg_cache[cache_key] = joblib.load(ref)
+						pkg = signal_pkg_cache[cache_key]
+						pred = predict_with_joblib_package_batch(pkg, x_valid)
+						pred_acc += pred.astype(np.float64)
+						pred_cnt += 1
+					except Exception as em:
+						print(f"[WARN] target {target_tag} channel {float(fch):.6f} model {str(model_name)} failed: {em}")
+						continue
+				if pred_cnt > 0:
+					y_syn_channels.append((pred_acc / float(pred_cnt)).astype(np.float32))
+					kept_freqs.append(float(fch))
+				else:
+					print(f"[WARN] target {target_tag} channel {float(fch):.6f} skipped: no valid signal predictions")
+
+			if not kept_freqs:
+				raise RuntimeError("No valid signal channels after model prediction")
+
+			roi_freq = np.asarray(kept_freqs, dtype=np.float64)
 			nchan = int(roi_freq.size)
 			tag = f"{float(target_freq):.6f}".replace(".", "p")
 			final_fits = os.path.join(out_dir, f"{out_prefix}_target{tag}.fits")
@@ -1194,23 +1225,7 @@ def run_cube_worker(cfg_path: str) -> int:
 			cube_final = np.full((nchan, ny, nx), np.nan, dtype=np.float32)
 			cube_syn = np.full((nchan, ny, nx), np.nan, dtype=np.float32)
 
-			y_syn_valid = np.zeros((n_valid, nchan), dtype=np.float32)
-			for i, (_, _, model_refs) in enumerate(roi_entries):
-				pred_acc = np.zeros((n_valid,), dtype=np.float64)
-				pred_cnt = 0
-				for model_name, ref in model_refs:
-					cache_key = f"{model_name}|{ref}"
-					if cache_key not in signal_pkg_cache:
-						if is_h5_signal:
-							signal_pkg_cache[cache_key] = load_joblib_package_from_h5(signal_models_source, ref)
-						else:
-							signal_pkg_cache[cache_key] = joblib.load(ref)
-					pkg = signal_pkg_cache[cache_key]
-					pred = predict_with_joblib_package_batch(pkg, x_valid)
-					pred_acc += pred.astype(np.float64)
-					pred_cnt += 1
-				if pred_cnt > 0:
-					y_syn_valid[:, i] = (pred_acc / float(pred_cnt)).astype(np.float32)
+			y_syn_valid = np.stack(y_syn_channels, axis=1).astype(np.float32)
 
 			noise_sum = np.zeros((n_valid, nchan), dtype=np.float64)
 			noise_cnt = np.zeros((n_valid, nchan), dtype=np.float64)
@@ -1449,20 +1464,56 @@ def _filter_cubes_by_target_freqs(cube_paths: List[str], target_freqs: List[floa
 	return out
 
 
-def _find_missing_target_freqs(requested_freqs: List[float], available_cube_paths: List[str], tol: float = 1e-6) -> List[float]:
-	req = [float(v) for v in (requested_freqs or []) if np.isfinite(float(v))]
-	if not req:
+def _find_missing_target_freqs(requested_freqs: List[float], cube_paths: List[str], tol: float = 1e-6) -> List[float]:
+	requested = [float(v) for v in (requested_freqs or []) if np.isfinite(float(v))]
+	if not requested:
 		return []
-	avail: List[float] = []
-	for p in (available_cube_paths or []):
-		fv = _extract_target_freq_from_cube_filename(p)
-		if fv is not None and np.isfinite(float(fv)):
-			avail.append(float(fv))
+	available = []
+	for p in (cube_paths or []):
+		ft = _extract_target_freq_from_cube_filename(p)
+		if ft is not None and np.isfinite(float(ft)):
+			available.append(float(ft))
 	missing: List[float] = []
-	for rv in req:
-		if not any(abs(float(rv) - float(av)) <= float(tol) for av in avail):
-			missing.append(float(rv))
+	for r in requested:
+		if not any(abs(float(r) - float(a)) <= float(tol) for a in available):
+			missing.append(float(r))
 	return missing
+
+
+def _read_warn_lines(log_path: str, max_lines: int = 100) -> List[str]:
+	if (not log_path) or (not os.path.isfile(log_path)):
+		return []
+	try:
+		with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
+			lines = [ln.rstrip("\n") for ln in f.readlines()]
+		warns = [ln for ln in lines if "[WARN]" in str(ln)]
+		if len(warns) > int(max_lines):
+			warns = warns[-int(max_lines):]
+		return warns
+	except Exception:
+		return []
+
+
+def _read_target_failure_reasons(log_path: str) -> Dict[float, List[str]]:
+	out: Dict[float, List[str]] = {}
+	if (not log_path) or (not os.path.isfile(log_path)):
+		return out
+	pat = re.compile(r"\[WARN\]\s+target\s+([0-9]+(?:\.[0-9]+)?)\s+failed:\s*(.*)", flags=re.IGNORECASE)
+	try:
+		with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
+			for ln in f:
+				m = pat.search(str(ln).strip())
+				if not m:
+					continue
+				try:
+					ft = float(m.group(1))
+				except Exception:
+					continue
+				reason = str(m.group(2)).strip()
+				out.setdefault(float(ft), []).append(reason)
+	except Exception:
+		return out
+	return out
 
 
 def _get_cube_ny_nx(cube_fits_path: str):
@@ -1603,6 +1654,8 @@ def _ensure_state():
 		st.session_state.p6_guide_cube2_refresh = False
 	if "p6_cube2_last_run_target_freqs" not in st.session_state:
 		st.session_state.p6_cube2_last_run_target_freqs = []
+	if "p6_cube_last_run_target_freqs" not in st.session_state:
+		st.session_state.p6_cube_last_run_target_freqs = []
 
 
 def _is_running() -> bool:
@@ -2174,6 +2227,7 @@ A remarkable upsurge in the complexity of molecules identified in the interstell
 					st.session_state.cube_log_path = log_path
 					st.session_state.cube_cfg_path = cfg_path
 					st.session_state.cube_log_handle = log_fh
+					st.session_state.p6_cube_last_run_target_freqs = [float(v) for v in target_freqs_cube_run]
 					st.success("Cube generation started.")
 				except Exception as e:
 					st.error(f"Could not start process: {e}")
@@ -2191,6 +2245,11 @@ A remarkable upsurge in the complexity of molecules identified in the interstell
 				code = proc.poll()
 				if code == 0:
 					st.success("Status: finished successfully")
+					warn_lines = _read_warn_lines(str(st.session_state.get("cube_log_path", "")), max_lines=120)
+					if warn_lines:
+						st.warning("Se detectaron frecuencias objetivo con fallo. Revisa el detalle del log.")
+						with st.expander("Show worker warnings"):
+							st.text("\n".join(warn_lines))
 				elif code is not None:
 					st.error(f"Status: finished with code {code}")
 					log_tail = _read_log_tail(str(st.session_state.get("cube_log_path", "")), n_lines=80)
@@ -2224,7 +2283,27 @@ A remarkable upsurge in the complexity of molecules identified in the interstell
 				else:
 					st.caption("Progress image is being written, retrying on next refresh...")
 
-		latest_final = _find_latest_final_main_cube(cube_out_dir)
+		final_cubes_all_main = _find_all_final_main_cubes(cube_out_dir)
+		guide_targets_for_cube = _normalize_target_freqs_for_run(parse_freq_list(str(st.session_state.get("p6_guide_freqs_main_input", ""))))
+		if not guide_targets_for_cube:
+			guide_targets_for_cube = [float(v) for v in st.session_state.get("p6_cube_last_run_target_freqs", []) if np.isfinite(float(v))]
+		final_cubes_main = _filter_cubes_by_target_freqs(final_cubes_all_main, guide_targets_for_cube)
+		if guide_targets_for_cube:
+			st.caption("ROIs simuladas para Guide frequencies: " + _freqs_to_text(guide_targets_for_cube))
+		missing_targets_main = _find_missing_target_freqs(guide_targets_for_cube, final_cubes_all_main)
+		if missing_targets_main:
+			fail_reasons_main = _read_target_failure_reasons(str(st.session_state.get("cube_log_path", "")))
+			if fail_reasons_main:
+				msg_lines_main: List[str] = []
+				for mf in missing_targets_main:
+					reasons = fail_reasons_main.get(float(mf), [])
+					if reasons:
+						msg_lines_main.append(f"{float(mf):.6f} GHz -> {reasons[-1]}")
+				if msg_lines_main:
+					with st.expander("Why did these target frequencies fail?"):
+						st.text("\n".join(msg_lines_main))
+
+		latest_final = final_cubes_main[-1] if final_cubes_main else _find_latest_final_main_cube(cube_out_dir)
 		shape_ref = _get_cube_ny_nx(latest_final) if latest_final else None
 		if shape_ref is not None:
 			ny_ref, nx_ref = int(shape_ref[0]), int(shape_ref[1])
@@ -2282,7 +2361,9 @@ A remarkable upsurge in the complexity of molecules identified in the interstell
 			_plot_spectrum(spec_data.get("freq"), spec_data.get("y_syn"), spec_data.get("y_noise"), spec_data.get("y_final"), chart_key="p6_spec_plot_cube")
 
 		st.markdown("**Download generated cube**")
-		cubes_for_download = _find_all_final_main_cubes(cube_out_dir)
+		cubes_for_download = list(final_cubes_main)
+		if not cubes_for_download:
+			cubes_for_download = _find_all_final_main_cubes(cube_out_dir)
 		if cubes_for_download:
 			sel_cube_dl = st.selectbox(
 				"Select cube",
@@ -2426,8 +2507,12 @@ A remarkable upsurge in the complexity of molecules identified in the interstell
 			st.rerun()
 
 		guide_freqs_run2 = _normalize_target_freqs_for_run(parse_freq_list(str(st.session_state.get("p6_guide_freqs_cube2_input", ""))))
-		target_freqs_cube2 = guide_freqs_run2 if guide_freqs_run2 else _normalize_target_freqs_for_run([float(v) for v in target_freqs])
-		st.caption("Target frequencies used for Simulate Single Spectrum: " + _freqs_to_text(target_freqs_cube2))
+		target_freqs_cube2 = [float(v) for v in guide_freqs_run2]
+		if target_freqs_cube2:
+			st.caption("Target frequencies used for Simulate Single Spectrum: " + _freqs_to_text(target_freqs_cube2))
+		else:
+			st.caption("Target frequencies used for Simulate Single Spectrum: (empty)")
+		st.caption("Las ROIs seleccionadas en desplegables solo se usarán si se agregan a Guide frequencies.")
 
 		cube2_out_dir = st.text_input("Output directory", value=os.path.join(DEFAULT_OUTPUT_DIR, "cube2"), key="p6_cube2_outdir")
 		p21, p22, p23, p24 = st.columns(4)
@@ -2449,9 +2534,7 @@ A remarkable upsurge in the complexity of molecules identified in the interstell
 		if start_cube2:
 			target_freqs_cube2_run = _normalize_target_freqs_for_run(parse_freq_list(str(st.session_state.get("p6_guide_freqs_cube2_input", ""))))
 			if not target_freqs_cube2_run:
-				target_freqs_cube2_run = _normalize_target_freqs_for_run([float(v) for v in target_freqs])
-			if not target_freqs_cube2_run:
-				st.error("Add at least one target frequency.")
+				st.error("Guide frequencies está vacío. Agrega al menos una frecuencia o usa 'Add selected ROI combination to Guide frequencies'.")
 			elif not os.path.isfile(filter_file):
 				st.error(f"Filter file not found: {filter_file}")
 			elif (not signal_models_root) or ((not os.path.isfile(signal_models_root)) and (not os.path.isdir(signal_models_root))):
@@ -2516,6 +2599,11 @@ A remarkable upsurge in the complexity of molecules identified in the interstell
 				code2 = proc2.poll()
 				if code2 == 0:
 					st.success("Status: finished successfully")
+					warn_lines2 = _read_warn_lines(str(st.session_state.get("cube_log_path", "")), max_lines=120)
+					if warn_lines2:
+						st.warning("Se detectaron frecuencias objetivo con fallo. Revisa el detalle del log.")
+						with st.expander("Show worker warnings"):
+							st.text("\n".join(warn_lines2))
 				elif code2 is not None:
 					st.error(f"Status: finished with code {code2}")
 					log_tail2 = _read_log_tail(str(st.session_state.get("cube_log_path", "")), n_lines=80)
@@ -2531,14 +2619,20 @@ A remarkable upsurge in the complexity of molecules identified in the interstell
 		if not guide_targets_for_sim:
 			guide_targets_for_sim = [float(v) for v in st.session_state.get("p6_cube2_last_run_target_freqs", []) if np.isfinite(float(v))]
 		final_cubes2 = _filter_cubes_by_target_freqs(final_cubes2_all, guide_targets_for_sim)
-		if final_cubes2_all and (not final_cubes2):
-			st.warning("No se encontraron cubos que coincidan con las Guide frequencies actuales. Mostrando todos los cubos disponibles.")
-			final_cubes2 = final_cubes2_all
 		if guide_targets_for_sim:
 			st.caption("ROIs simuladas para Guide frequencies: " + _freqs_to_text(guide_targets_for_sim))
-		missing_targets_cube2 = _find_missing_target_freqs(guide_targets_for_sim, final_cubes2)
-		if missing_targets_cube2:
-			st.warning("Faltan cubos para algunas Guide frequencies: " + _freqs_to_text(missing_targets_cube2) + ". Revisa el log del worker para ver por qué no se generaron.")
+		missing_targets2 = _find_missing_target_freqs(guide_targets_for_sim, final_cubes2_all)
+		if missing_targets2:
+			fail_reasons2 = _read_target_failure_reasons(str(st.session_state.get("cube_log_path", "")))
+			if fail_reasons2:
+				msg_lines2: List[str] = []
+				for mf in missing_targets2:
+					reasons = fail_reasons2.get(float(mf), [])
+					if reasons:
+						msg_lines2.append(f"{float(mf):.6f} GHz -> {reasons[-1]}")
+				if msg_lines2:
+					with st.expander("Why did these target frequencies fail?"):
+						st.text("\n".join(msg_lines2))
 		if final_cubes2:
 			st.markdown("**Final spectra by target frequency (1x1 cube)**")
 			n_cols = 2 if len(final_cubes2) <= 4 else 3
