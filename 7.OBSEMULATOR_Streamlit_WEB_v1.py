@@ -1861,6 +1861,29 @@ def _cleanup_generated_outputs_on_startup_once():
 	st.session_state.p6_cleanup_done = True
 
 
+def _cleanup_generated_outputs_for_dir(out_dir: str, include_cube2_logs: bool = False):
+	if (not out_dir) or (not os.path.isdir(out_dir)):
+		return
+	for name in os.listdir(out_dir):
+		p = os.path.join(out_dir, name)
+		ln = str(name).lower()
+		try:
+			if os.path.isfile(p):
+				is_cube_fits = str(name).startswith(f"{DEFAULT_OUT_PREFIX}_target") and ln.endswith(".fits")
+				is_progress_png = ln.endswith("_inprogress_map.png")
+				is_progress_json = ln.endswith("_inprogress_map.json")
+				is_run_log = ln.startswith("cube_run_") and ln.endswith(".log")
+				if include_cube2_logs:
+					is_run_log = is_run_log or (ln.startswith("cube2_run_") and ln.endswith(".log"))
+				if is_cube_fits or is_progress_png or is_progress_json or is_run_log:
+					os.remove(p)
+			elif os.path.isdir(p):
+				if str(name).startswith("uploaded_maps_") or str(name).startswith("implicit_maps_"):
+					shutil.rmtree(p, ignore_errors=True)
+		except Exception:
+			pass
+
+
 def _load_module_from_path(path: Path, module_name: str):
 	if not path.is_file():
 		raise FileNotFoundError(f"Cannot load module from missing file: {path}")
@@ -2183,6 +2206,9 @@ A remarkable upsurge in the complexity of molecules identified in the interstell
 			else:
 				try:
 					os.makedirs(cube_out_dir, exist_ok=True)
+					_cleanup_generated_outputs_for_dir(str(cube_out_dir), include_cube2_logs=False)
+					st.session_state.p6_cube_download_cache = []
+					st.session_state.p6_cube_download_selected = ""
 					uploaded = {"tex": up_tex, "logn": up_logn, "velo": up_velo, "fwhm": up_fwhm}
 					n_uploaded = sum(v is not None for v in uploaded.values())
 					if n_uploaded not in (0, 4):
@@ -2341,7 +2367,7 @@ A remarkable upsurge in the complexity of molecules identified in the interstell
 				pix_x = st.number_input("Spectrum pixel X", min_value=0, value=0, step=1, key="p6_spec_pixel_x")
 
 		plot_cubes_main = list(final_cubes_main) if final_cubes_main else list(final_cubes_all_main)
-		if plot_cubes_main:
+		if (not running) and plot_cubes_main:
 			st.markdown(f"**Final spectra grid by target frequency | pixel (y={int(pix_y)}, x={int(pix_x)})**")
 			n_cols_main = 2 if len(plot_cubes_main) <= 4 else 3
 			cols_main = st.columns(n_cols_main)
@@ -2354,6 +2380,8 @@ A remarkable upsurge in the complexity of molecules identified in the interstell
 						_plot_spectrum(freq_pc, y_syn_pc, y_noise_pc, y_final_pc, chart_key=plot_key_pc)
 					else:
 						st.error(f"Could not read spectrum: {err_pc}")
+		elif running:
+			st.caption("Spectrum grid will be shown after cube generation finishes.")
 
 		st.markdown("**Download generated cube**")
 		cubes_for_download_now = _find_all_final_main_cubes(cube_out_dir)
