@@ -43,7 +43,7 @@ except Exception:
 DEFAULT_MERGED_H5 = ""
 DEFAULT_NOISE_NN_H5 = ""
 DEFAULT_FILTER_FILE = ""
-DEFAULT_GDRIVE_MODELS_LINK = "https://drive.google.com/drive/folders/1xOaeLegEwOF6iDGdO_CYOAANJgWzQdkt?usp=drive_link"
+DEFAULT_GDRIVE_MODELS_LINK = "https://drive.google.com/drive/folders/1Zm3UpfWfXfa-Uh1sc1HBH3o25qYvqMNH?usp=drive_link"
 
 DEFAULT_TARGET_FREQS = [
 	84.299,
@@ -1282,7 +1282,8 @@ def run_cube_worker(cfg_path: str) -> int:
 			print(f"[WARN] target {float(target_freq):.6f} failed: {e}")
 			continue
 	if n_ok <= 0:
-		raise RuntimeError(f"No cubes were generated successfully. Failed targets: {n_fail}/{len(target_freqs)}")
+		print(f"[WARN] No cubes were generated successfully. Failed targets: {n_fail}/{len(target_freqs)}")
+		print("[WARN] Worker finished without output cubes. This can happen when selected guide frequencies only overlap noise ROIs but not synthetic ROIs.")
 	return 0
 
 
