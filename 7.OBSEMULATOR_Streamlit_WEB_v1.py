@@ -43,7 +43,7 @@ except Exception:
 DEFAULT_MERGED_H5 = ""
 DEFAULT_NOISE_NN_H5 = ""
 DEFAULT_FILTER_FILE = ""
-DEFAULT_GDRIVE_MODELS_LINK = "https://drive.google.com/drive/folders/1xOaeLegEwOF6iDGdO_CYOAANJgWzQdkt?usp=drive_link"
+DEFAULT_GDRIVE_MODELS_LINK = "https://drive.google.com/drive/folders/1Zm3UpfWfXfa-Uh1sc1HBH3o25qYvqMNH?usp=drive_link"
 
 DEFAULT_TARGET_FREQS = [
 	84.299,
@@ -1571,6 +1571,12 @@ def _extract_pixel_spectra(final_fits_path: str, ypix: Optional[int] = None, xpi
 				if arr_s is not None and arr_s.ndim == 3 and arr_s.shape == arr.shape:
 					y_syn = np.asarray(arr_s[:, yc, xc], dtype=np.float32)
 		y_noise = (y_final - y_syn).astype(np.float32) if y_syn is not None else None
+		if y_noise is not None:
+			try:
+				if (not np.any(np.isfinite(y_noise))) or (float(np.nanmax(np.abs(y_noise))) <= 1e-12):
+					y_noise = None
+			except Exception:
+				pass
 		return freq, y_syn, y_noise, y_final, None
 	except Exception as e:
 		return None, None, None, None, str(e)
