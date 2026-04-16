@@ -1070,9 +1070,9 @@ def _plot_roi_overview(signal_rois: List[dict], noise_rois: List[dict], guide_fr
 			mode="lines+markers",
 			line=dict(color=color, width=width),
 			marker=dict(size=6, color=color),
-			name="Signal ROI",
+			name="Synthetic ROI",
 			showlegend=False,
-			hovertemplate=f"Signal ROI {int(r['index'])}<br>{float(r['lo']):.6f} - {float(r['hi']):.6f} GHz<extra></extra>",
+			hovertemplate=f"Synthetic ROI {int(r['index'])}<br>{float(r['lo']):.6f} - {float(r['hi']):.6f} GHz<extra></extra>",
 		))
 	for r in noise_rois:
 		is_sel = (selected_noise_index is not None) and (int(r["index"]) == int(selected_noise_index))
@@ -1100,7 +1100,7 @@ def _plot_roi_overview(signal_rois: List[dict], noise_rois: List[dict], guide_fr
 		yaxis=dict(
 			tickmode="array",
 			tickvals=[0.0, 1.0],
-			ticktext=["Noise ROIs", "Signal ROIs"],
+			ticktext=["Noise ROIs", "Synthetic ROIs"],
 			range=[-0.5, 1.5],
 		),
 		template="plotly_white",
@@ -1603,6 +1603,26 @@ def _spectrum_to_csv_bytes(freq, y_syn, y_noise, y_final) -> Optional[bytes]:
 	return out.getvalue().encode("utf-8")
 
 
+def _spectrum_to_txt_bytes(freq, y_syn, y_noise, y_final) -> Optional[bytes]:
+	if freq is None or y_final is None:
+		return None
+	f = np.asarray(freq, dtype=np.float64).reshape(-1)
+	yf = np.asarray(y_final, dtype=np.float64).reshape(-1)
+	if f.size != yf.size or f.size == 0:
+		return None
+	ys = np.asarray(y_syn, dtype=np.float64).reshape(-1) if y_syn is not None else None
+	yn = np.asarray(y_noise, dtype=np.float64).reshape(-1) if y_noise is not None else None
+
+	out = io.StringIO()
+	head = ["freq_ghz", "synthetic", "predicted_noise", "synthetic_plus_noise"]
+	out.write("\t".join(head) + "\n")
+	for i in range(int(f.size)):
+		vs = "" if ys is None or ys.size != f.size else f"{float(ys[i]):.10g}"
+		vn = "" if yn is None or yn.size != f.size else f"{float(yn[i]):.10g}"
+		out.write(f"{float(f[i]):.10g}\t{vs}\t{vn}\t{float(yf[i]):.10g}\n")
+	return out.getvalue().encode("utf-8")
+
+
 def _ensure_state():
 	if "cube_proc" not in st.session_state:
 		st.session_state.cube_proc = None
@@ -1946,10 +1966,10 @@ def _generate_obs_payload_cached(
 
 
 def run_streamlit_app():
-	st.set_page_config(page_title="PREDOBS", page_icon="🧪", layout="wide")
+	st.set_page_config(page_title="OBSEMULATOR", page_icon="🧪", layout="wide")
 	_ensure_state()
 	_cleanup_generated_outputs_on_startup_once()
-	st.title("PREDOBS")
+	st.title("OBSEMULATOR")
 
 	intro_img = _project_dir() / "NGC6523_BVO_2.jpg"
 	if intro_img.is_file():
@@ -2366,9 +2386,9 @@ A remarkable upsurge in the complexity of molecules identified in the interstell
 			with sp2:
 				pix_x = st.number_input("Spectrum pixel X", min_value=0, value=0, step=1, key="p6_spec_pixel_x")
 
-		plot_cubes_main = list(final_cubes_main) if final_cubes_main else list(final_cubes_all_main)
+		plot_cubes_main = list(final_cubes_all_main)
 		if (not running) and plot_cubes_main:
-			st.markdown(f"**Final spectra grid by target frequency | pixel (y={int(pix_y)}, x={int(pix_x)})**")
+			st.markdown(f"**Final spectra grid (all generated cubes) | pixel (y={int(pix_y)}, x={int(pix_x)})**")
 			n_cols_main = 2 if len(plot_cubes_main) <= 4 else 3
 			cols_main = st.columns(n_cols_main)
 			for i_pc, pc_path in enumerate(plot_cubes_main):
@@ -2703,16 +2723,16 @@ A remarkable upsurge in the complexity of molecules identified in the interstell
 				if err_dl is not None:
 					st.error(f"Could not read spectrum: {err_dl}")
 				else:
-					csv_bytes = _spectrum_to_csv_bytes(freq_dl, y_syn_dl, y_noise_dl, y_final_dl)
-					if csv_bytes is None:
-						st.error("Could not serialize spectrum to CSV.")
+					txt_bytes = _spectrum_to_txt_bytes(freq_dl, y_syn_dl, y_noise_dl, y_final_dl)
+					if txt_bytes is None:
+						st.error("Could not serialize spectrum to TXT.")
 					else:
 						base_name = os.path.splitext(os.path.basename(str(sel_spec_cube)))[0]
 						st.download_button(
-							"Download spectrum (.csv)",
-							data=csv_bytes,
-							file_name=f"{base_name}_spectrum.csv",
-							mime="text/csv",
+							"Download spectrum (.txt)",
+							data=txt_bytes,
+							file_name=f"{base_name}_spectrum.txt",
+							mime="text/plain",
 							key="p6_spec_download_button",
 						)
 			else:
