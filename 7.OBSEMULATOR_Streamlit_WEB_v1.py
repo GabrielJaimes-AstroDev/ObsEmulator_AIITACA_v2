@@ -1834,6 +1834,323 @@ def _generate_synthetic_spectra_for_targets(
 	return results, warnings_out
 
 
+def _sample_fit_candidates(n_samples: int, ranges: dict, seed: int) -> np.ndarray:
+	n = int(max(1, n_samples))
+	rng = np.random.default_rng(int(seed))
+	logn = rng.uniform(float(ranges["logn_min"]), float(ranges["logn_max"]), size=n)
+	tex = rng.uniform(float(ranges["tex_min"]), float(ranges["tex_max"]), size=n)
+	velo = rng.uniform(float(ranges["velo_min"]), float(ranges["velo_max"]), size=n)
+	fwhm = rng.uniform(float(ranges["fwhm_min"]), float(ranges["fwhm_max"]), size=n)
+	X = np.stack([logn, tex, velo, fwhm], axis=1).astype(np.float32)
+	# Ensure center candidate is present
+	X[0, 0] = 0.5 * (float(ranges["logn_min"]) + float(ranges["logn_max"]))
+	X[0, 1] = 0.5 * (float(ranges["tex_min"]) + float(ranges["tex_max"]))
+	X[0, 2] = 0.5 * (float(ranges["velo_min"]) + float(ranges["velo_max"]))
+	X[0, 3] = 0.5 * (float(ranges["fwhm_min"]) + float(ranges["fwhm_max"]))
+	return X
+
+
+def _predict_synthetic_batch_single_target(
+	signal_models_source: str,
+	filter_file: str,
+	target_freq_ghz: float,
+	x_candidates: np.ndarray,
+	pred_mode: str,
+	selected_model_name: str,
+	allow_nearest: bool,
+	pkg_cache: Dict[str, object],
+):
+	is_h5_signal = os.path.isfile(signal_models_source) and str(signal_models_source).lower().endswith(".h5")
+	is_h5, roi_entries, _ = build_signal_index_for_roi(
+		signal_source=signal_models_source,
+		filter_file=filter_file,
+		target_frequency_ghz=float(target_freq_ghz),
+		pred_mode=pred_mode,
+		selected_model_name=selected_model_name,
+		allow_nearest=allow_nearest,
+	)
+	use_h5 = bool(is_h5 and is_h5_signal)
+	n_cand = int(x_candidates.shape[0])
+	cols = []
+	kept_freqs: List[float] = []
+
+	for _, fch, model_refs in roi_entries:
+		pred_acc = np.zeros((n_cand,), dtype=np.float64)
+		pred_cnt = 0
+		for model_name, ref in model_refs:
+			cache_key = f"{model_name}|{ref}"
+			try:
+				if cache_key not in pkg_cache:
+					if use_h5:
+						pkg_cache[cache_key] = load_joblib_package_from_h5(signal_models_source, ref)
+					else:
+						pkg_cache[cache_key] = joblib.load(ref)
+				pkg = pkg_cache[cache_key]
+				pred = predict_with_joblib_package_batch(pkg, x_candidates)
+				pred_acc += pred.astype(np.float64)
+				pred_cnt += 1
+			except Exception:
+				continue
+		if pred_cnt > 0:
+			cols.append((pred_acc / float(pred_cnt)).astype(np.float32))
+			kept_freqs.append(float(fch))
+
+	if not cols:
+		return None, None, "No valid synthetic predictions for selected ROI"
+
+	roi_freq = np.asarray(kept_freqs, dtype=np.float64)
+	Y_syn = np.stack(cols, axis=1).astype(np.float32)
+	ord_idx = np.argsort(roi_freq)
+	return roi_freq[ord_idx], Y_syn[:, ord_idx], None
+
+
+def _add_noise_batch_for_target(
+	noise_models_loaded: List[tuple],
+	roi_freq: np.ndarray,
+	y_syn_batch: np.ndarray,
+	x_candidates: np.ndarray,
+	noise_scale: float,
+):
+	n_cand, n_chan = int(y_syn_batch.shape[0]), int(y_syn_batch.shape[1])
+	noise_sum = np.zeros((n_cand, n_chan), dtype=np.float64)
+	noise_cnt = np.zeros((n_cand, n_chan), dtype=np.float64)
+	for noise_model, noise_scaler, noise_cfg in (noise_models_loaded or []):
+		segs = get_noise_segments_for_axis(noise_cfg, roi_freq)
+		for idx, spw_idx in segs:
+			idx = np.asarray(idx, dtype=np.int64)
+			ys_seg = y_syn_batch[:, idx]
+			try:
+				noise_seg = predict_noise_segment_batch(
+					model=noise_model,
+					scaler_y=noise_scaler,
+					cfg_noise=noise_cfg,
+					y_synth_segment_batch=ys_seg,
+					x_features_batch=x_candidates,
+					spw_idx=int(spw_idx),
+					noise_scale=float(noise_scale),
+					batch_size=2048,
+				)
+				noise_sum[:, idx] += noise_seg.astype(np.float64)
+				noise_cnt[:, idx] += 1.0
+			except Exception:
+				continue
+
+	y_noise = np.zeros((n_cand, n_chan), dtype=np.float32)
+	m = noise_cnt > 0
+	if np.any(m):
+		y_noise[m] = (noise_sum[m] / noise_cnt[m]).astype(np.float32)
+	return y_noise, m
+
+
+def _vectorized_fit_metrics(y_true: np.ndarray, y_pred_batch: np.ndarray):
+	y = np.asarray(y_true, dtype=np.float64).reshape(1, -1)
+	p = np.asarray(y_pred_batch, dtype=np.float64)
+	err = p - y
+	mae = np.mean(np.abs(err), axis=1)
+	rmse = np.sqrt(np.mean(err ** 2, axis=1))
+	den = float(np.sum((y.reshape(-1) - float(np.mean(y))) ** 2))
+	if den > 0:
+		r2 = 1.0 - (np.sum(err ** 2, axis=1) / den)
+	else:
+		r2 = np.full((p.shape[0],), np.nan, dtype=np.float64)
+	eps = float(max(1e-12, np.quantile(np.abs(y.reshape(-1)), 0.1)))
+	chi_like = np.mean((err ** 2) / (np.abs(y) + eps), axis=1)
+	return mae.astype(np.float64), rmse.astype(np.float64), r2.astype(np.float64), chi_like.astype(np.float64)
+
+
+def _run_roi_fitting(
+	signal_models_source: str,
+	noise_models_root: str,
+	filter_file: str,
+	target_freqs: List[float],
+	obs_freq: np.ndarray,
+	obs_intensity: np.ndarray,
+	case_mode: str,
+	n_candidates: int,
+	ranges: dict,
+	noise_scale: float,
+	allow_nearest: bool,
+	seed: int,
+):
+	X = _sample_fit_candidates(n_samples=int(n_candidates), ranges=ranges, seed=int(seed))
+	n = int(X.shape[0])
+	pkg_cache: Dict[str, object] = {}
+	warnings_out: List[str] = []
+
+	noise_models_loaded = []
+	if str(case_mode).strip().lower() == "synthetic_plus_noise":
+		entries = _list_noise_model_entries(noise_models_root)
+		for e in entries:
+			try:
+				m, sy, c = _load_noisenn_from_entry(e)
+				m.eval()
+				noise_models_loaded.append((m, sy, c))
+			except Exception:
+				continue
+		if not noise_models_loaded:
+			warnings_out.append("No valid noise models loaded. Falling back to synthetic-only fitting.")
+
+	mae_acc = np.zeros((n,), dtype=np.float64)
+	roi_acc = np.zeros((n,), dtype=np.float64)
+	per_roi_rows: List[dict] = []
+	best_plot_payload: List[dict] = []
+
+	for tf in [float(v) for v in (target_freqs or [])]:
+		tag = f"{float(tf):.6f}"
+		try:
+			roi_freq, y_syn_batch, err = _predict_synthetic_batch_single_target(
+				signal_models_source=signal_models_source,
+				filter_file=filter_file,
+				target_freq_ghz=float(tf),
+				x_candidates=X,
+				pred_mode=DEFAULT_PRED_MODE,
+				selected_model_name=DEFAULT_SELECTED_MODEL_NAME,
+				allow_nearest=allow_nearest,
+				pkg_cache=pkg_cache,
+			)
+			if err is not None or roi_freq is None or y_syn_batch is None:
+				warnings_out.append(f"target {tag} skipped: {err if err else 'empty ROI prediction'}")
+				continue
+
+			y_eval = y_syn_batch
+			y_noise_best = None
+			if (str(case_mode).strip().lower() == "synthetic_plus_noise") and noise_models_loaded:
+				y_noise_batch, _ = _add_noise_batch_for_target(
+					noise_models_loaded=noise_models_loaded,
+					roi_freq=roi_freq,
+					y_syn_batch=y_syn_batch,
+					x_candidates=X,
+					noise_scale=float(noise_scale),
+				)
+				y_eval = (y_syn_batch + y_noise_batch).astype(np.float32)
+
+			y_obs_roi = np.interp(roi_freq, np.asarray(obs_freq, dtype=np.float64), np.asarray(obs_intensity, dtype=np.float64), left=np.nan, right=np.nan)
+			valid = np.isfinite(y_obs_roi)
+			if int(np.count_nonzero(valid)) < 3:
+				warnings_out.append(f"target {tag} skipped: insufficient overlap with uploaded observational spectrum")
+				continue
+
+			y_true = np.asarray(y_obs_roi[valid], dtype=np.float64)
+			y_pred_batch = np.asarray(y_eval[:, valid], dtype=np.float64)
+			mae, rmse, r2, chi_like = _vectorized_fit_metrics(y_true, y_pred_batch)
+			best_i = int(np.argmin(mae))
+
+			mae_acc += mae
+			roi_acc += 1.0
+
+			per_roi_rows.append({
+				"target_freq_ghz": float(tf),
+				"n_channels": int(roi_freq.size),
+				"n_overlap_points": int(np.count_nonzero(valid)),
+				"best_MAE": float(mae[best_i]),
+				"best_RMSE": float(rmse[best_i]),
+				"best_R2": float(r2[best_i]) if np.isfinite(float(r2[best_i])) else np.nan,
+				"best_CHI_like": float(chi_like[best_i]),
+				"best_logN": float(X[best_i, 0]),
+				"best_Tex": float(X[best_i, 1]),
+				"best_Velocity": float(X[best_i, 2]),
+				"best_FWHM": float(X[best_i, 3]),
+			})
+
+			if (str(case_mode).strip().lower() == "synthetic_plus_noise") and noise_models_loaded:
+				y_noise_best = (y_eval[best_i] - y_syn_batch[best_i]).astype(np.float64)
+
+			best_plot_payload.append({
+				"target_freq_ghz": float(tf),
+				"freq": np.asarray(roi_freq, dtype=np.float64),
+				"obs_interp": np.asarray(y_obs_roi, dtype=np.float64),
+				"best_synthetic": np.asarray(y_syn_batch[best_i], dtype=np.float64),
+				"best_noise": (None if y_noise_best is None else np.asarray(y_noise_best, dtype=np.float64)),
+				"best_pred": np.asarray(y_eval[best_i], dtype=np.float64),
+				"best_idx": int(best_i),
+			})
+		except Exception as e:
+			warnings_out.append(f"target {tag} skipped: {e}")
+			continue
+
+	valid_global = roi_acc > 0
+	if not np.any(valid_global):
+		return {
+			"ok": False,
+			"warnings": warnings_out,
+			"message": "No ROI could be fitted against uploaded spectrum.",
+		}
+
+	global_mae = np.full((n,), np.nan, dtype=np.float64)
+	global_mae[valid_global] = mae_acc[valid_global] / roi_acc[valid_global]
+	best_global_idx = int(np.nanargmin(global_mae))
+
+	# Build global overlay using a single best parameter vector across all fitted ROIs
+	x_best = np.asarray(X[best_global_idx:best_global_idx + 1], dtype=np.float32)
+	global_overlay = []
+	for tf in [float(v) for v in (target_freqs or [])]:
+		tag = f"{float(tf):.6f}"
+		try:
+			roi_freq_g, y_syn_g, err_g = _predict_synthetic_batch_single_target(
+				signal_models_source=signal_models_source,
+				filter_file=filter_file,
+				target_freq_ghz=float(tf),
+				x_candidates=x_best,
+				pred_mode=DEFAULT_PRED_MODE,
+				selected_model_name=DEFAULT_SELECTED_MODEL_NAME,
+				allow_nearest=allow_nearest,
+				pkg_cache=pkg_cache,
+			)
+			if err_g is not None or roi_freq_g is None or y_syn_g is None:
+				continue
+
+			y_pred_g = np.asarray(y_syn_g[0], dtype=np.float64)
+			y_noise_g = None
+			if (str(case_mode).strip().lower() == "synthetic_plus_noise") and noise_models_loaded:
+				y_noise_b, _ = _add_noise_batch_for_target(
+					noise_models_loaded=noise_models_loaded,
+					roi_freq=roi_freq_g,
+					y_syn_batch=np.asarray(y_syn_g, dtype=np.float32),
+					x_candidates=x_best,
+					noise_scale=float(noise_scale),
+				)
+				y_noise_g = np.asarray(y_noise_b[0], dtype=np.float64)
+				y_pred_g = y_pred_g + y_noise_g
+
+			y_obs_g = np.interp(
+				roi_freq_g,
+				np.asarray(obs_freq, dtype=np.float64),
+				np.asarray(obs_intensity, dtype=np.float64),
+				left=np.nan,
+				right=np.nan,
+			)
+			global_overlay.append({
+				"target_freq_ghz": float(tf),
+				"freq": np.asarray(roi_freq_g, dtype=np.float64),
+				"obs_interp": np.asarray(y_obs_g, dtype=np.float64),
+				"best_global_synthetic": np.asarray(y_syn_g[0], dtype=np.float64),
+				"best_global_noise": (None if y_noise_g is None else np.asarray(y_noise_g, dtype=np.float64)),
+				"best_global_pred": np.asarray(y_pred_g, dtype=np.float64),
+			})
+		except Exception:
+			warnings_out.append(f"target {tag} skipped in global overlay build")
+			continue
+
+	return {
+		"ok": True,
+		"case_mode": str(case_mode),
+		"n_candidates": int(n),
+		"best_global_index": int(best_global_idx),
+		"best_global_params": {
+			"logN": float(X[best_global_idx, 0]),
+			"Tex": float(X[best_global_idx, 1]),
+			"Velocity": float(X[best_global_idx, 2]),
+			"FWHM": float(X[best_global_idx, 3]),
+		},
+		"best_global_mean_MAE": float(global_mae[best_global_idx]),
+		"n_rois_fitted": int(np.max(roi_acc)),
+		"per_roi": per_roi_rows,
+		"plot_payload": best_plot_payload,
+		"global_overlay": global_overlay,
+		"warnings": warnings_out,
+	}
+
+
 def _ensure_state():
 	if "cube_proc" not in st.session_state:
 		st.session_state.cube_proc = None
@@ -1909,6 +2226,16 @@ def _ensure_state():
 		st.session_state.p6_synth_only_results = {}
 	if "p6_synth_only_warnings" not in st.session_state:
 		st.session_state.p6_synth_only_warnings = []
+	if "p6_guide_freqs_fit_input" not in st.session_state:
+		st.session_state.p6_guide_freqs_fit_input = _freqs_to_text([float(v) for v in DEFAULT_TARGET_FREQS])
+	if "p6_guide_freqs_fit_pending" not in st.session_state:
+		st.session_state.p6_guide_freqs_fit_pending = ""
+	if "p6_guide_fit_refresh" not in st.session_state:
+		st.session_state.p6_guide_fit_refresh = False
+	if "p6_guide_freqs_fit_last_nonempty" not in st.session_state:
+		st.session_state.p6_guide_freqs_fit_last_nonempty = ""
+	if "p6_fit_last_result" not in st.session_state:
+		st.session_state.p6_fit_last_result = None
 
 
 def _is_running() -> bool:
@@ -2279,7 +2606,7 @@ A remarkable upsurge in the complexity of molecules identified in the interstell
 		st.caption("ROI selection mode for cube generation: exact overlap only (nearest disabled).")
 		noise_scale = st.number_input("Noise scale", min_value=0.0, value=float(DEFAULT_NOISE_SCALE), step=0.1, format="%.3f")
 
-	tab_cube, tab_cube2, tab_cube3 = st.tabs(["Cube Generator", "Simulate Single Spectrum", "Simulate Single Synthetic Spectrum"])
+	tab_cube, tab_cube2, tab_cube3, tab_fit = st.tabs(["Cube Generator", "Simulate Single Spectrum", "Simulate Single Synthetic Spectrum", "Fitting"])
 
 	try:
 		syngen_path = _resolve_local_file("4.SYNGEN_Streamlit_v1.py")
@@ -3329,6 +3656,239 @@ A remarkable upsurge in the complexity of molecules identified in the interstell
 		else:
 			st.caption("No synthetic spectra available yet.")
 
+	with tab_fit:
+		st.subheader("Fitting")
+		st.caption("Upload an observational spectrum and fit synthetic models per ROI using Guide frequencies.")
+
+		fit_case = st.radio(
+			"Fitting mode",
+			options=["Case 1: Synthetic only", "Case 2: Synthetic + noise"],
+			horizontal=True,
+			key="p6_fit_case_mode",
+		)
+		fit_case_mode = "synthetic_only" if "Case 1" in str(fit_case) else "synthetic_plus_noise"
+
+		if bool(st.session_state.get("p6_guide_fit_refresh", False)):
+			st.session_state.p6_guide_freqs_fit_input = str(st.session_state.get("p6_guide_freqs_fit_pending", "")).strip()
+			st.session_state.p6_guide_fit_refresh = False
+			st.session_state.p6_guide_freqs_fit_pending = ""
+		if not str(st.session_state.get("p6_guide_freqs_fit_input", "")).strip():
+			last_fit = str(st.session_state.get("p6_guide_freqs_fit_last_nonempty", "")).strip()
+			if last_fit:
+				st.session_state.p6_guide_freqs_fit_input = last_fit
+			else:
+				st.session_state.p6_guide_freqs_fit_input = _freqs_to_text([float(v) for v in target_freqs])
+
+		guide_freqs_fit_text = st.text_input(
+			"Guide frequencies (GHz; defines ROIs to fit)",
+			key="p6_guide_freqs_fit_input",
+		)
+		if str(guide_freqs_fit_text).strip():
+			st.session_state.p6_guide_freqs_fit_last_nonempty = str(guide_freqs_fit_text).strip()
+		guide_freqs_fit = _normalize_target_freqs_for_run(parse_freq_list(str(guide_freqs_fit_text)))
+		if guide_freqs_fit:
+			st.caption("Target frequencies used for fitting: " + _freqs_to_text(guide_freqs_fit))
+
+		# ROI quick explorer for fitting context
+		signal_rois_fit = _collect_signal_rois_for_ui(signal_models_root, filter_file)
+		noise_rois_fit = _collect_noise_rois_for_ui(noise_models_root)
+		signal_rois_fit, noise_rois_fit = _mark_roi_overlaps(signal_rois_fit, noise_rois_fit)
+		if signal_rois_fit or noise_rois_fit:
+			_plot_roi_overview(
+				signal_rois_fit,
+				noise_rois_fit,
+				guide_freqs_ghz=guide_freqs_fit,
+				selected_combo_freqs_ghz=None,
+				selected_signal_index=None,
+				selected_noise_index=None,
+				chart_key="p6_roi_overview_fit",
+			)
+
+		up_obs_fit = st.file_uploader(
+			"Upload observational spectrum (.txt/.dat/.csv)",
+			type=None,
+			key="p6_fit_upload_obs",
+		)
+		obs_freq_fit, obs_vals_fit, obs_err_fit = _read_uploaded_spectrum_any(up_obs_fit) if up_obs_fit is not None else (None, None, None)
+		if up_obs_fit is not None and obs_err_fit is not None:
+			st.error(f"Could not parse uploaded observational spectrum: {obs_err_fit}")
+
+		with st.expander("Fitting search ranges and speed settings", expanded=False):
+			cfr1, cfr2, cfr3, cfr4 = st.columns(4)
+			with cfr1:
+				fit_logn_min = st.number_input("logN min", value=12.0, key="p6_fit_logn_min")
+				fit_logn_max = st.number_input("logN max", value=19.5, key="p6_fit_logn_max")
+			with cfr2:
+				fit_tex_min = st.number_input("Tex min", value=20.0, key="p6_fit_tex_min")
+				fit_tex_max = st.number_input("Tex max", value=380.0, key="p6_fit_tex_max")
+			with cfr3:
+				fit_velo_min = st.number_input("Velocity min", value=-5.0, key="p6_fit_velo_min")
+				fit_velo_max = st.number_input("Velocity max", value=105.0, key="p6_fit_velo_max")
+			with cfr4:
+				fit_fwhm_min = st.number_input("FWHM min", value=1.0, key="p6_fit_fwhm_min")
+				fit_fwhm_max = st.number_input("FWHM max", value=15.0, key="p6_fit_fwhm_max")
+
+			cfsp1, cfsp2 = st.columns(2)
+			with cfsp1:
+				n_candidates_fit = st.number_input("Number of candidates", min_value=50, max_value=4000, value=600, step=50, key="p6_fit_n_candidates")
+			with cfsp2:
+				seed_fit = st.number_input("Random seed", min_value=0, value=42, step=1, key="p6_fit_seed")
+
+		run_fit = st.button("Run fitting", type="primary", key="p6_run_fitting_btn")
+		if run_fit:
+			if up_obs_fit is None or obs_freq_fit is None or obs_vals_fit is None:
+				st.error("Upload a valid observational spectrum first.")
+			elif not guide_freqs_fit:
+				st.error("Guide frequencies is empty. Add at least one frequency.")
+			elif not os.path.isfile(filter_file):
+				st.error(f"Filter file not found: {filter_file}")
+			elif (not signal_models_root) or ((not os.path.isfile(signal_models_root)) and (not os.path.isdir(signal_models_root))):
+				st.error("Signal models source invalid.")
+			else:
+				ranges_fit = {
+					"logn_min": float(min(fit_logn_min, fit_logn_max)),
+					"logn_max": float(max(fit_logn_min, fit_logn_max)),
+					"tex_min": float(min(fit_tex_min, fit_tex_max)),
+					"tex_max": float(max(fit_tex_min, fit_tex_max)),
+					"velo_min": float(min(fit_velo_min, fit_velo_max)),
+					"velo_max": float(max(fit_velo_min, fit_velo_max)),
+					"fwhm_min": float(min(fit_fwhm_min, fit_fwhm_max)),
+					"fwhm_max": float(max(fit_fwhm_min, fit_fwhm_max)),
+				}
+				with st.spinner("Running efficient batch fitting per ROI..."):
+					fit_result = _run_roi_fitting(
+						signal_models_source=str(signal_models_root),
+						noise_models_root=str(noise_models_root),
+						filter_file=str(filter_file),
+						target_freqs=[float(v) for v in guide_freqs_fit],
+						obs_freq=np.asarray(obs_freq_fit, dtype=np.float64),
+						obs_intensity=np.asarray(obs_vals_fit, dtype=np.float64),
+						case_mode=str(fit_case_mode),
+						n_candidates=int(n_candidates_fit),
+						ranges=ranges_fit,
+						noise_scale=float(noise_scale),
+						allow_nearest=bool(allow_nearest),
+						seed=int(seed_fit),
+					)
+				st.session_state.p6_fit_last_result = fit_result
+
+		fit_result = st.session_state.get("p6_fit_last_result", None)
+		if isinstance(fit_result, dict):
+			if not bool(fit_result.get("ok", False)):
+				st.warning(str(fit_result.get("message", "No fitting result available.")))
+			else:
+				bp = fit_result.get("best_global_params", {}) if isinstance(fit_result.get("best_global_params", {}), dict) else {}
+				st.success(
+					"Best global fit | "
+					f"logN={float(bp.get('logN', np.nan)):.4f}, "
+					f"Tex={float(bp.get('Tex', np.nan)):.4f}, "
+					f"Velocity={float(bp.get('Velocity', np.nan)):.4f}, "
+					f"FWHM={float(bp.get('FWHM', np.nan)):.4f}, "
+					f"mean MAE={float(fit_result.get('best_global_mean_MAE', np.nan)):.6g}"
+				)
+				st.caption(
+					f"Mode: {fit_result.get('case_mode', '')} | "
+					f"Candidates: {int(fit_result.get('n_candidates', 0))} | "
+					f"ROIs fitted: {int(fit_result.get('n_rois_fitted', 0))}"
+				)
+
+				global_overlay = fit_result.get("global_overlay", [])
+				if isinstance(global_overlay, list) and global_overlay:
+					segments = []
+					for gg in global_overlay:
+						fg = np.asarray(gg.get("freq", []), dtype=np.float64)
+						yg_obs = np.asarray(gg.get("obs_interp", []), dtype=np.float64)
+						yg_pred = np.asarray(gg.get("best_global_pred", []), dtype=np.float64)
+						if fg.size == 0 or yg_pred.size != fg.size:
+							continue
+						segments.append((float(np.nanmin(fg)), fg, yg_obs, yg_pred, gg))
+
+					if segments:
+						segments = sorted(segments, key=lambda t: t[0])
+						f_cat = []
+						o_cat = []
+						p_cat = []
+						for i_s, (_, fg, og, pg, _) in enumerate(segments):
+							if i_s > 0:
+								f_cat.append(np.array([np.nan], dtype=np.float64))
+								o_cat.append(np.array([np.nan], dtype=np.float64))
+								p_cat.append(np.array([np.nan], dtype=np.float64))
+							f_cat.append(fg)
+							o_cat.append(og)
+							p_cat.append(pg)
+
+						fig_global = go.Figure()
+						# Full uploaded observational spectrum (if available)
+						if (obs_freq_fit is not None) and (obs_vals_fit is not None):
+							fig_global.add_trace(go.Scatter(
+								x=np.asarray(obs_freq_fit, dtype=np.float64),
+								y=np.asarray(obs_vals_fit, dtype=np.float64),
+								mode="lines",
+								name="Observed (uploaded)",
+								line=dict(width=1.4),
+							))
+						fig_global.add_trace(go.Scatter(
+							x=np.concatenate(f_cat),
+							y=np.concatenate(o_cat),
+							mode="lines",
+							name="Observed (ROI interp)",
+							line=dict(dash="dot", width=1.2),
+						))
+						fig_global.add_trace(go.Scatter(
+							x=np.concatenate(f_cat),
+							y=np.concatenate(p_cat),
+							mode="lines",
+							name="Best fit (global)",
+							line=dict(width=2.0),
+						))
+						fig_global.update_layout(
+							title="Observed spectrum vs best global fit",
+							xaxis_title="Frequency (GHz)",
+							yaxis_title="Intensity",
+							template="plotly_white",
+							height=430,
+							margin=dict(l=40, r=20, t=45, b=40),
+						)
+						st.plotly_chart(fig_global, width="stretch", key="p6_fit_global_overlay_plot")
+
+				rows_fit = fit_result.get("per_roi", [])
+				if isinstance(rows_fit, list) and rows_fit:
+					st.markdown("**Per-ROI fitting statistics**")
+					st.dataframe(rows_fit, use_container_width=True)
+
+				plots_fit = fit_result.get("plot_payload", [])
+				if isinstance(plots_fit, list) and plots_fit:
+					st.markdown("**Best-match spectrum per ROI**")
+					n_cols_fit = 2 if len(plots_fit) <= 4 else 3
+					cols_fit = st.columns(n_cols_fit)
+					for i_pf, pf in enumerate(plots_fit):
+						fpf = np.asarray(pf.get("freq", []), dtype=np.float64)
+						yobs = np.asarray(pf.get("obs_interp", []), dtype=np.float64)
+						ys = np.asarray(pf.get("best_synthetic", []), dtype=np.float64)
+						yn = pf.get("best_noise", None)
+						yp = np.asarray(pf.get("best_pred", []), dtype=np.float64)
+						with cols_fit[i_pf % n_cols_fit]:
+							st.caption(f"target {float(pf.get('target_freq_ghz', np.nan)):.6f} GHz")
+							fig_fit = go.Figure()
+							fig_fit.add_trace(go.Scatter(x=fpf, y=yobs, mode="lines", name="Observed (interp)"))
+							fig_fit.add_trace(go.Scatter(x=fpf, y=ys, mode="lines", name="Best synthetic", line=dict(dash="dash")))
+							if yn is not None:
+								fig_fit.add_trace(go.Scatter(x=fpf, y=np.asarray(yn, dtype=np.float64), mode="lines", name="Best noise", line=dict(dash="dot")))
+							fig_fit.add_trace(go.Scatter(x=fpf, y=yp, mode="lines", name="Best predicted"))
+							fig_fit.update_layout(
+								xaxis_title="Frequency (GHz)",
+								yaxis_title="Intensity",
+								template="plotly_white",
+								height=360,
+								margin=dict(l=40, r=20, t=35, b=35),
+							)
+							st.plotly_chart(fig_fit, width="stretch", key=f"p6_fit_plot_{i_pf}")
+
+			warns_fit = fit_result.get("warnings", [])
+			if isinstance(warns_fit, list) and warns_fit:
+				with st.expander("Show fitting warnings"):
+					st.text("\n".join([str(w) for w in warns_fit]))
+
 
 def _worker_entry_if_needed() -> bool:
 	if "--cube-worker" not in sys.argv:
@@ -3353,3 +3913,4 @@ def _worker_entry_if_needed() -> bool:
 if __name__ == "__main__":
 	if not _worker_entry_if_needed():
 		run_streamlit_app()
+
