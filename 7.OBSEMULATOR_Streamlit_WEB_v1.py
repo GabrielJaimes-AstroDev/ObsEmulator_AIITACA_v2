@@ -2995,16 +2995,12 @@ A remarkable upsurge in the complexity of molecules identified in the interstell
 			if guide_changed3:
 				if signal_rois3:
 					st.session_state.p6_signal_roi_select3 = int(_pick_default_roi_index(signal_rois3, guide_freq3))
-				if noise_rois3:
-					st.session_state.p6_noise_roi_select3 = int(_pick_default_roi_index(noise_rois3, guide_freq3))
 				st.session_state.p6_roi3_guide_prev = guide_key3
 
 			if signal_rois3 and int(st.session_state.get("p6_signal_roi_select3", 0)) >= len(signal_rois3):
 				st.session_state.p6_signal_roi_select3 = 0
-			if noise_rois3 and int(st.session_state.get("p6_noise_roi_select3", 0)) >= len(noise_rois3):
-				st.session_state.p6_noise_roi_select3 = 0
 
-			c3_roi_1, c3_roi_2 = st.columns(2)
+			c3_roi_1, c3_roi_2 = st.columns([3, 2])
 			with c3_roi_1:
 				if signal_rois3:
 					sig_opts3 = list(range(len(signal_rois3)))
@@ -3025,33 +3021,16 @@ A remarkable upsurge in the complexity of molecules identified in the interstell
 					st.caption("No signal ROIs available")
 
 			with c3_roi_2:
-				if noise_rois3:
-					noi_opts3 = list(range(len(noise_rois3)))
-					st.selectbox(
-						"Noise-model ROIs",
-						options=noi_opts3,
-						format_func=lambda i: (
-							f"ROI N{noise_rois3[i]['index']} | {noise_rois3[i]['lo']:.6f}–{noise_rois3[i]['hi']:.6f} GHz"
-							+ (
-								f" | MATCHED BETWEEN MODELS: S{',S'.join([str(v) for v in _get_overlapping_signal_roi_indices(noise_rois3[i], signal_rois3)])}"
-								if _get_overlapping_signal_roi_indices(noise_rois3[i], signal_rois3)
-								else " | no overlap"
-							)
-						),
-						key="p6_noise_roi_select3",
-					)
-				else:
-					st.caption("No noise ROIs available")
+				st.caption("Noise ROI selector hidden in this tab (synthetic-only mode).")
 
 			sel_sig_idx3 = None if not signal_rois3 else int(signal_rois3[int(st.session_state.get("p6_signal_roi_select3", 0))]["index"])
-			sel_noi_idx3 = None if not noise_rois3 else int(noise_rois3[int(st.session_state.get("p6_noise_roi_select3", 0))]["index"])
 			combo_freqs3 = _selected_roi_combo_freqs(
 				signal_rois=signal_rois3,
 				noise_rois=noise_rois3,
 				selected_signal_pos=int(st.session_state.get("p6_signal_roi_select3", 0)) if signal_rois3 else None,
-				selected_noise_pos=int(st.session_state.get("p6_noise_roi_select3", 0)) if noise_rois3 else None,
+				selected_noise_pos=None,
 			)
-			_plot_roi_overview(signal_rois3, noise_rois3, guide_freqs_ghz=guide_freqs3, selected_combo_freqs_ghz=combo_freqs3, selected_signal_index=sel_sig_idx3, selected_noise_index=sel_noi_idx3, chart_key="p6_roi_overview_cube3")
+			_plot_roi_overview(signal_rois3, noise_rois3, guide_freqs_ghz=guide_freqs3, selected_combo_freqs_ghz=combo_freqs3, selected_signal_index=sel_sig_idx3, selected_noise_index=None, chart_key="p6_roi_overview_cube3")
 
 		if st.button("Add selected ROI combination to Guide frequencies", key="p6_add_rois_to_guide_cube3"):
 			updated_freqs3 = _append_selected_rois_to_freq_list(
@@ -3059,7 +3038,7 @@ A remarkable upsurge in the complexity of molecules identified in the interstell
 				signal_rois=signal_rois3,
 				noise_rois=noise_rois3,
 				selected_signal_pos=int(st.session_state.get("p6_signal_roi_select3", 0)) if signal_rois3 else None,
-				selected_noise_pos=int(st.session_state.get("p6_noise_roi_select3", 0)) if noise_rois3 else None,
+				selected_noise_pos=None,
 			)
 			st.session_state.p6_guide_freqs_cube3_pending = _freqs_to_text(updated_freqs3)
 			st.session_state.p6_guide_cube3_refresh = True
@@ -3136,11 +3115,16 @@ A remarkable upsurge in the complexity of molecules identified in the interstell
 					if f3.size == 0 or y3.size == 0:
 						st.caption("No data")
 						continue
+					fmin3 = float(np.nanmin(f3))
+					fmax3 = float(np.nanmax(f3))
+					span3 = float(max(1e-6, fmax3 - fmin3))
+					pad3 = float(max(5e-5, 0.08 * span3))
 					fig3 = go.Figure()
 					fig3.add_trace(go.Scatter(x=f3, y=y3, mode="lines", name="Synthetic"))
 					if (up_freq3 is not None) and (up_vals3 is not None):
 						fig3.add_trace(go.Scatter(x=up_freq3, y=up_vals3, mode="lines", name="Uploaded synthetic", line=dict(dash="dot")))
 					fig3.update_layout(
+						xaxis=dict(range=[fmin3 - pad3, fmax3 + pad3]),
 						xaxis_title="Frequency (GHz)",
 						yaxis_title="Intensity",
 						template="plotly_white",
