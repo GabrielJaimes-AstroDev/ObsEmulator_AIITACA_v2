@@ -1981,12 +1981,17 @@ def _run_roi_fitting(
 	obs_freq: np.ndarray,
 	obs_intensity: np.ndarray,
 	case_mode: str,
+	fit_criterion: str,
 	n_candidates: int,
 	ranges: dict,
 	noise_scale: float,
 	allow_nearest: bool,
 	seed: int,
 ):
+	crit = str(fit_criterion).strip().lower()
+	if crit not in {"mae", "rmse", "chi_like", "r2"}:
+		crit = "mae"
+
 	X = _sample_fit_candidates(n_samples=int(n_candidates), ranges=ranges, seed=int(seed))
 	n = int(X.shape[0])
 	pkg_cache: Dict[str, object] = {}
@@ -2010,6 +2015,7 @@ def _run_roi_fitting(
 			}
 
 	mae_acc = np.zeros((n,), dtype=np.float64)
+	objective_acc = np.zeros((n,), dtype=np.float64)
 	roi_acc = np.zeros((n,), dtype=np.float64)
 	per_roi_rows: List[dict] = []
 	best_plot_payload: List[dict] = []
@@ -2062,9 +2068,19 @@ def _run_roi_fitting(
 			y_true = np.asarray(y_obs_roi[valid], dtype=np.float64)
 			y_pred_batch = np.asarray(y_eval[:, valid], dtype=np.float64)
 			mae, rmse, r2, chi_like = _vectorized_fit_metrics(y_true, y_pred_batch)
-			best_i = int(np.argmin(mae))
+			if crit == "rmse":
+				obj = np.asarray(rmse, dtype=np.float64)
+			elif crit == "chi_like":
+				obj = np.asarray(chi_like, dtype=np.float64)
+			elif crit == "r2":
+				obj = -np.asarray(r2, dtype=np.float64)
+			else:
+				obj = np.asarray(mae, dtype=np.float64)
+			obj[~np.isfinite(obj)] = np.inf
+			best_i = int(np.argmin(obj))
 
 			mae_acc += mae
+			objective_acc += obj
 			roi_acc += 1.0
 
 			per_roi_rows.append({
@@ -2079,6 +2095,8 @@ def _run_roi_fitting(
 				"best_Tex": float(X[best_i, 1]),
 				"best_Velocity": float(X[best_i, 2]),
 				"best_FWHM": float(X[best_i, 3]),
+				"criterion_used": str(crit),
+				"best_objective": float(obj[best_i]),
 			})
 
 			if (str(case_mode).strip().lower() == "synthetic_plus_noise") and noise_models_loaded:
@@ -2105,9 +2123,12 @@ def _run_roi_fitting(
 			"message": "No ROI could be fitted against uploaded spectrum.",
 		}
 
+	global_obj = np.full((n,), np.nan, dtype=np.float64)
+	global_obj[valid_global] = objective_acc[valid_global] / roi_acc[valid_global]
+	best_global_idx = int(np.nanargmin(global_obj))
+
 	global_mae = np.full((n,), np.nan, dtype=np.float64)
 	global_mae[valid_global] = mae_acc[valid_global] / roi_acc[valid_global]
-	best_global_idx = int(np.nanargmin(global_mae))
 
 	# Build global overlay using a single best parameter vector across all fitted ROIs
 	x_best = np.asarray(X[best_global_idx:best_global_idx + 1], dtype=np.float32)
@@ -2180,6 +2201,8 @@ def _run_roi_fitting(
 			"Velocity": float(X[best_global_idx, 2]),
 			"FWHM": float(X[best_global_idx, 3]),
 		},
+		"fit_criterion": str(crit),
+		"best_global_mean_objective": float(global_obj[best_global_idx]),
 		"best_global_mean_MAE": float(global_mae[best_global_idx]),
 		"n_rois_fitted": int(np.max(roi_acc)),
 		"per_roi": per_roi_rows,
@@ -3777,6 +3800,12 @@ A remarkable upsurge in the complexity of molecules identified in the interstell
 			st.caption(f"Observational spectrum shifted by {float(obs_shift_kms):+.4f} km/s using mode: {str(obs_shift_mode)}")
 
 		with st.expander("Fitting search ranges and speed settings", expanded=False):
+			fit_criterion_ui = st.selectbox(
+				"Fitting criterion",
+				options=["MAE", "RMSE", "CHI_like", "R2"],
+				index=0,
+				key="p6_fit_criterion",
+			)
 			cfr1, cfr2, cfr3, cfr4 = st.columns(4)
 			with cfr1:
 				fit_logn_min = st.number_input("logN min", value=12.0, key="p6_fit_logn_min")
@@ -3829,6 +3858,7 @@ A remarkable upsurge in the complexity of molecules identified in the interstell
 						obs_freq=np.asarray(obs_freq_fit_used, dtype=np.float64),
 						obs_intensity=np.asarray(obs_vals_fit_used, dtype=np.float64),
 						case_mode=str(fit_case_mode),
+						fit_criterion=str(fit_criterion_ui).strip().lower(),
 						n_candidates=int(n_candidates_fit),
 						ranges=ranges_fit,
 						noise_scale=float(noise_scale),
@@ -3843,12 +3873,16 @@ A remarkable upsurge in the complexity of molecules identified in the interstell
 				st.warning(str(fit_result.get("message", "No fitting result available.")))
 			else:
 				bp = fit_result.get("best_global_params", {}) if isinstance(fit_result.get("best_global_params", {}), dict) else {}
+				fit_crit_used = str(fit_result.get("fit_criterion", "mae"))
+				fit_obj = float(fit_result.get("best_global_mean_objective", np.nan))
+				fit_obj_show = (-fit_obj if fit_crit_used == "r2" else fit_obj)
 				st.success(
 					"Best global fit | "
 					f"logN={float(bp.get('logN', np.nan)):.4f}, "
 					f"Tex={float(bp.get('Tex', np.nan)):.4f}, "
 					f"Velocity={float(bp.get('Velocity', np.nan)):.4f}, "
 					f"FWHM={float(bp.get('FWHM', np.nan)):.4f}, "
+					f"mean {fit_crit_used.upper()}={float(fit_obj_show):.6g} | "
 					f"mean MAE={float(fit_result.get('best_global_mean_MAE', np.nan)):.6g}"
 				)
 				st.caption(
