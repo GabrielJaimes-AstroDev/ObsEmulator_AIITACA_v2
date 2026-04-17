@@ -4032,7 +4032,7 @@ A remarkable upsurge in the complexity of molecules identified in the interstell
 			fit_candidate_mode_ui = st.selectbox(
 				"Candidate generation",
 				options=["Smart ordered grid", "Random"],
-				index=0,
+				index=1,
 				key="p6_fit_candidate_mode",
 			)
 			fit_candidate_mode_map = {
@@ -4108,7 +4108,7 @@ A remarkable upsurge in the complexity of molecules identified in the interstell
 						case_mode=str(fit_case_mode),
 						fit_criterion=str(fit_criterion_ui).strip().lower(),
 						global_weight_mode=str(fit_weight_mode_map.get(str(fit_weight_mode_ui), "uniform")),
-						candidate_mode=str(fit_candidate_mode_map.get(str(fit_candidate_mode_ui), "ordered_grid")),
+						candidate_mode=str(fit_candidate_mode_map.get(str(fit_candidate_mode_ui), "random")),
 						n_candidates=int(n_candidates_fit),
 						ranges=ranges_fit,
 						noise_scale=float(noise_scale),
