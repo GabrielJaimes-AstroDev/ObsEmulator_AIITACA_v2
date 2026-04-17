@@ -2463,14 +2463,25 @@ def _ensure_state():
 
 
 def _clear_fitting_outputs():
-	# Clear previous fitting payload and any dynamic chart keys.
-	st.session_state.p6_fit_last_result = None
+	# Clear previous fitting payload and dynamic output keys.
 	for k in list(st.session_state.keys()):
-		if str(k).startswith("p6_fit_plot_"):
+		ks = str(k)
+		if ks == "p6_fit_last_result":
+			st.session_state.pop(k, None)
+		elif ks.startswith("p6_fit_plot_"):
+			st.session_state.pop(k, None)
+		elif ks.startswith("p6_fit_tmp_"):
 			st.session_state.pop(k, None)
 	st.session_state.pop("p6_fit_global_overlay_plot", None)
+	st.session_state.pop("p6_roi_overview_fit", None)
 	try:
 		gc.collect()
+	except Exception:
+		pass
+	try:
+		if bool(getattr(torch, "cuda", None)) and bool(torch.cuda.is_available()):
+			torch.cuda.empty_cache()
+			torch.cuda.ipc_collect()
 	except Exception:
 		pass
 
