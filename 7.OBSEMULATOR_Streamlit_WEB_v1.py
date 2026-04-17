@@ -283,6 +283,21 @@ def inverse_target_transform(y_t, transform_name="none", scale=1.0):
 	return yy
 
 
+def _apply_velocity_shift_to_frequency(freq_ghz: np.ndarray, velocity_kms: float) -> np.ndarray:
+	c_kms = 299792.458
+	return np.asarray(freq_ghz, dtype=np.float64) * (1.0 - float(velocity_kms) / c_kms)
+
+
+def _apply_velocity_shift_by_spw_center(freq_ghz: np.ndarray, velocity_kms: float) -> np.ndarray:
+	f = np.asarray(freq_ghz, dtype=np.float64)
+	if f.size == 0:
+		return f
+	spw_center_ghz = float(0.5 * (np.nanmin(f) + np.nanmax(f)))
+	c_kms = 299792.458
+	delta_f = -float(spw_center_ghz) * (float(velocity_kms) / c_kms)
+	return f + delta_f
+
+
 def load_filter_data(path: str) -> Tuple[Optional[np.ndarray], np.ndarray]:
 	d = np.asarray(np.loadtxt(path), dtype=float)
 	if d.ndim == 1:
@@ -3713,6 +3728,31 @@ A remarkable upsurge in the complexity of molecules identified in the interstell
 		if up_obs_fit is not None and obs_err_fit is not None:
 			st.error(f"Could not parse uploaded observational spectrum: {obs_err_fit}")
 
+		# Optional observational frequency shift (same spirit as 1.MODELS_Ana workflows)
+		obs_shift_enabled = st.checkbox("Apply observational frequency shift", value=False, key="p6_fit_shift_enabled")
+		obs_shift_mode = st.selectbox(
+			"Shift mode",
+			options=["per_frequency", "spw_center"],
+			index=0,
+			key="p6_fit_shift_mode",
+		)
+		obs_shift_kms = st.number_input(
+			"Observational shift (km/s)",
+			value=98.0,
+			step=0.1,
+			format="%.4f",
+			key="p6_fit_shift_kms",
+		)
+
+		obs_freq_fit_used = None if obs_freq_fit is None else np.asarray(obs_freq_fit, dtype=np.float64).copy()
+		obs_vals_fit_used = None if obs_vals_fit is None else np.asarray(obs_vals_fit, dtype=np.float64).copy()
+		if (obs_freq_fit_used is not None) and bool(obs_shift_enabled):
+			if str(obs_shift_mode).strip().lower() == "spw_center":
+				obs_freq_fit_used = _apply_velocity_shift_by_spw_center(obs_freq_fit_used, float(obs_shift_kms))
+			else:
+				obs_freq_fit_used = _apply_velocity_shift_to_frequency(obs_freq_fit_used, float(obs_shift_kms))
+			st.caption(f"Observational spectrum shifted by {float(obs_shift_kms):+.4f} km/s using mode: {str(obs_shift_mode)}")
+
 		with st.expander("Fitting search ranges and speed settings", expanded=False):
 			cfr1, cfr2, cfr3, cfr4 = st.columns(4)
 			with cfr1:
@@ -3736,7 +3776,7 @@ A remarkable upsurge in the complexity of molecules identified in the interstell
 
 		run_fit = st.button("Run fitting", type="primary", key="p6_run_fitting_btn")
 		if run_fit:
-			if up_obs_fit is None or obs_freq_fit is None or obs_vals_fit is None:
+			if up_obs_fit is None or obs_freq_fit_used is None or obs_vals_fit_used is None:
 				st.error("Upload a valid observational spectrum first.")
 			elif not guide_freqs_fit:
 				st.error("Guide frequencies is empty. Add at least one frequency.")
@@ -3761,8 +3801,8 @@ A remarkable upsurge in the complexity of molecules identified in the interstell
 						noise_models_root=str(noise_models_root),
 						filter_file=str(filter_file),
 						target_freqs=[float(v) for v in guide_freqs_fit],
-						obs_freq=np.asarray(obs_freq_fit, dtype=np.float64),
-						obs_intensity=np.asarray(obs_vals_fit, dtype=np.float64),
+						obs_freq=np.asarray(obs_freq_fit_used, dtype=np.float64),
+						obs_intensity=np.asarray(obs_vals_fit_used, dtype=np.float64),
 						case_mode=str(fit_case_mode),
 						n_candidates=int(n_candidates_fit),
 						ranges=ranges_fit,
@@ -3819,10 +3859,10 @@ A remarkable upsurge in the complexity of molecules identified in the interstell
 
 						fig_global = go.Figure()
 						# Full uploaded observational spectrum (if available)
-						if (obs_freq_fit is not None) and (obs_vals_fit is not None):
+						if (obs_freq_fit_used is not None) and (obs_vals_fit_used is not None):
 							fig_global.add_trace(go.Scatter(
-								x=np.asarray(obs_freq_fit, dtype=np.float64),
-								y=np.asarray(obs_vals_fit, dtype=np.float64),
+								x=np.asarray(obs_freq_fit_used, dtype=np.float64),
+								y=np.asarray(obs_vals_fit_used, dtype=np.float64),
 								mode="lines",
 								name="Observed (uploaded)",
 								line=dict(width=1.4),
@@ -3913,4 +3953,3 @@ def _worker_entry_if_needed() -> bool:
 if __name__ == "__main__":
 	if not _worker_entry_if_needed():
 		run_streamlit_app()
-
