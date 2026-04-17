@@ -2728,7 +2728,11 @@ A remarkable upsurge in the complexity of molecules identified in the interstell
 			if last_cube2:
 				st.session_state.p6_guide_freqs_cube2_input = last_cube2
 			else:
-				st.session_state.p6_guide_freqs_cube2_input = _freqs_to_text([float(v) for v in target_freqs])
+				last_run_cube2 = [float(v) for v in st.session_state.get("p6_cube2_last_run_target_freqs", []) if np.isfinite(float(v))]
+				if last_run_cube2:
+					st.session_state.p6_guide_freqs_cube2_input = _freqs_to_text(last_run_cube2)
+				else:
+					st.session_state.p6_guide_freqs_cube2_input = _freqs_to_text([float(v) for v in target_freqs])
 		guide_freqs_text2 = st.text_input(
 			"Guide frequencies (GHz; main list used for Generate Observation)",
 			key="p6_guide_freqs_cube2_input",
@@ -2861,6 +2865,9 @@ A remarkable upsurge in the complexity of molecules identified in the interstell
 
 		if start_cube2:
 			target_freqs_cube2_run = _normalize_target_freqs_for_run(parse_freq_list(str(st.session_state.get("p6_guide_freqs_cube2_input", ""))))
+			guide_text2_now = str(st.session_state.get("p6_guide_freqs_cube2_input", "")).strip()
+			if guide_text2_now:
+				st.session_state.p6_guide_freqs_cube2_last_nonempty = guide_text2_now
 			if not target_freqs_cube2_run:
 				st.error("Guide frequencies está vacío. Agrega al menos una frecuencia o usa 'Add selected ROI combination to Guide frequencies'.")
 			elif not os.path.isfile(filter_file):
@@ -2872,6 +2879,7 @@ A remarkable upsurge in the complexity of molecules identified in the interstell
 			else:
 				try:
 					os.makedirs(cube2_out_dir, exist_ok=True)
+					_cleanup_generated_outputs_for_dir(str(cube2_out_dir), include_cube2_logs=True)
 					maps_dir2, map_files2 = _create_implicit_param_maps(
 						out_root_dir=str(cube2_out_dir),
 						logn_val=float(logn_cube2),
@@ -2910,6 +2918,8 @@ A remarkable upsurge in the complexity of molecules identified in the interstell
 					st.session_state.cube_cfg_path = cfg_path2
 					st.session_state.cube_log_handle = log_fh2
 					st.session_state.p6_cube2_last_run_target_freqs = [float(v) for v in target_freqs_cube2_run]
+					st.session_state.p6_guide_freqs_cube2_input = _freqs_to_text([float(v) for v in target_freqs_cube2_run])
+					st.session_state.p6_guide_freqs_cube2_last_nonempty = str(st.session_state.p6_guide_freqs_cube2_input)
 					st.success("Cube generation started.")
 				except Exception as e:
 					st.error(f"Could not start process: {e}")
