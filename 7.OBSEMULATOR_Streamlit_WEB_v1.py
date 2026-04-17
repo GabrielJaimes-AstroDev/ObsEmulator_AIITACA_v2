@@ -43,7 +43,7 @@ except Exception:
 DEFAULT_MERGED_H5 = ""
 DEFAULT_NOISE_NN_H5 = ""
 DEFAULT_FILTER_FILE = ""
-DEFAULT_GDRIVE_MODELS_LINK = "https://drive.google.com/drive/folders/1rkSAT8Dp5Zo5HM6S2VMeAPPRYw4asz1v?usp=drive_link"
+DEFAULT_GDRIVE_MODELS_LINK = "https://drive.google.com/drive/folders/1Zm3UpfWfXfa-Uh1sc1HBH3o25qYvqMNH?usp=drive_link"
 
 DEFAULT_TARGET_FREQS = [
 	84.299,
@@ -1629,6 +1629,157 @@ def _spectrum_to_txt_bytes(freq, y_syn, y_noise, y_final) -> Optional[bytes]:
 	return out.getvalue().encode("utf-8")
 
 
+def _synthetic_spectrum_to_txt_bytes(freq, y_syn) -> Optional[bytes]:
+	if freq is None or y_syn is None:
+		return None
+	f = np.asarray(freq, dtype=np.float64).reshape(-1)
+	ys = np.asarray(y_syn, dtype=np.float64).reshape(-1)
+	if f.size != ys.size or f.size == 0:
+		return None
+	out = io.StringIO()
+	out.write("freq_ghz\tsynthetic\n")
+	for i in range(int(f.size)):
+		out.write(f"{float(f[i]):.10g}\t{float(ys[i]):.10g}\n")
+	return out.getvalue().encode("utf-8")
+
+
+def _read_uploaded_spectrum_any(upload_obj):
+	if upload_obj is None:
+		return None, None, "No file uploaded"
+	try:
+		raw = upload_obj.getvalue()
+		if not raw:
+			return None, None, "Empty file"
+		text = raw.decode("utf-8", errors="ignore")
+	except Exception as e:
+		return None, None, str(e)
+
+	freqs: List[float] = []
+	vals: List[float] = []
+	for line in str(text).splitlines():
+		s = str(line).strip()
+		if (not s) or s.startswith("#") or s.startswith("//") or s.startswith("!"):
+			continue
+		parts = re.split(r"[\s,;\t]+", s)
+		if len(parts) < 2:
+			continue
+		try:
+			ff = float(parts[0])
+			yy = float(parts[1])
+		except Exception:
+			continue
+		freqs.append(float(ff))
+		vals.append(float(yy))
+
+	if not freqs:
+		return None, None, "No valid frequency-intensity rows found"
+
+	f = np.asarray(freqs, dtype=np.float64)
+	y = np.asarray(vals, dtype=np.float64)
+	if np.nanmedian(np.abs(f)) > 1e6:
+		f = f / 1e9
+	ord_idx = np.argsort(f)
+	return f[ord_idx], y[ord_idx], None
+
+
+def _build_noise_cube_bytes_from_pair(final_fits_path: str, synth_fits_path: str):
+	if fits is None:
+		return None, "FITS backend not available"
+	if (not final_fits_path) or (not os.path.isfile(final_fits_path)):
+		return None, "Final cube file not found"
+	if (not synth_fits_path) or (not os.path.isfile(synth_fits_path)):
+		return None, "Synthetic cube file not found"
+	try:
+		with fits.open(final_fits_path, memmap=True) as hfin:
+			arr_fin = np.asarray(hfin[0].data, dtype=np.float32)
+			hdr_fin = hfin[0].header.copy()
+		with fits.open(synth_fits_path, memmap=True) as hsyn:
+			arr_syn = np.asarray(hsyn[0].data, dtype=np.float32)
+		if arr_fin.shape != arr_syn.shape:
+			return None, f"Shape mismatch: final={arr_fin.shape}, synth={arr_syn.shape}"
+		arr_noise = (arr_fin - arr_syn).astype(np.float32)
+		hdr_fin["HISTORY"] = "Derived noise-only cube: FINAL - SYNTHONLY"
+		bio = io.BytesIO()
+		fits.writeto(bio, arr_noise, header=hdr_fin, overwrite=True)
+		return bio.getvalue(), None
+	except Exception as e:
+		return None, str(e)
+
+
+def _generate_synthetic_spectra_for_targets(
+	signal_models_source: str,
+	filter_file: str,
+	target_freqs: List[float],
+	x_features: List[float],
+	pred_mode: str,
+	selected_model_name: str,
+	allow_nearest: bool,
+):
+	results: Dict[str, dict] = {}
+	warnings_out: List[str] = []
+	if (not signal_models_source) or ((not os.path.isfile(signal_models_source)) and (not os.path.isdir(signal_models_source))):
+		return results, ["Signal models source invalid."]
+	if not os.path.isfile(filter_file):
+		return results, [f"Filter file not found: {filter_file}"]
+
+	x_arr = np.asarray(x_features, dtype=np.float32).reshape(1, -1)
+	is_h5_signal = os.path.isfile(signal_models_source) and str(signal_models_source).lower().endswith(".h5")
+	pkg_cache: Dict[str, object] = {}
+
+	for tf in [float(v) for v in (target_freqs or [])]:
+		tag = f"{float(tf):.6f}"
+		try:
+			is_h5, roi_entries, _ = build_signal_index_for_roi(
+				signal_source=signal_models_source,
+				filter_file=filter_file,
+				target_frequency_ghz=float(tf),
+				pred_mode=pred_mode,
+				selected_model_name=selected_model_name,
+				allow_nearest=allow_nearest,
+			)
+			use_h5 = bool(is_h5 and is_h5_signal)
+			freqs: List[float] = []
+			yvals: List[float] = []
+			for _, fch, model_refs in roi_entries:
+				pred_acc = 0.0
+				pred_cnt = 0
+				for model_name, ref in model_refs:
+					cache_key = f"{model_name}|{ref}"
+					try:
+						if cache_key not in pkg_cache:
+							if use_h5:
+								pkg_cache[cache_key] = load_joblib_package_from_h5(signal_models_source, ref)
+							else:
+								pkg_cache[cache_key] = joblib.load(ref)
+						pkg = pkg_cache[cache_key]
+						pred = predict_with_joblib_package_batch(pkg, x_arr)
+						pred_acc += float(pred[0])
+						pred_cnt += 1
+					except Exception:
+						continue
+				if pred_cnt > 0:
+					freqs.append(float(fch))
+					yvals.append(float(pred_acc / float(pred_cnt)))
+
+			if not freqs:
+				warnings_out.append(f"target {tag} failed: no valid synthetic predictions in selected ROI")
+				continue
+
+			ord_idx = np.argsort(np.asarray(freqs, dtype=np.float64))
+			f_arr = np.asarray(freqs, dtype=np.float64)[ord_idx]
+			y_arr = np.asarray(yvals, dtype=np.float64)[ord_idx]
+			results[tag] = {
+				"target_freq_ghz": float(tf),
+				"freq": f_arr,
+				"synthetic": y_arr,
+			}
+		except Exception as e:
+			warnings_out.append(f"target {tag} failed: {e}")
+			continue
+
+	return results, warnings_out
+
+
 def _ensure_state():
 	if "cube_proc" not in st.session_state:
 		st.session_state.cube_proc = None
@@ -1692,6 +1843,18 @@ def _ensure_state():
 		st.session_state.p6_guide_freqs_main_last_nonempty = ""
 	if "p6_guide_freqs_cube2_last_nonempty" not in st.session_state:
 		st.session_state.p6_guide_freqs_cube2_last_nonempty = ""
+	if "p6_guide_freqs_cube3_input" not in st.session_state:
+		st.session_state.p6_guide_freqs_cube3_input = _freqs_to_text([float(v) for v in DEFAULT_TARGET_FREQS])
+	if "p6_guide_freqs_cube3_pending" not in st.session_state:
+		st.session_state.p6_guide_freqs_cube3_pending = ""
+	if "p6_guide_cube3_refresh" not in st.session_state:
+		st.session_state.p6_guide_cube3_refresh = False
+	if "p6_guide_freqs_cube3_last_nonempty" not in st.session_state:
+		st.session_state.p6_guide_freqs_cube3_last_nonempty = ""
+	if "p6_synth_only_results" not in st.session_state:
+		st.session_state.p6_synth_only_results = {}
+	if "p6_synth_only_warnings" not in st.session_state:
+		st.session_state.p6_synth_only_warnings = []
 
 
 def _is_running() -> bool:
@@ -2062,7 +2225,7 @@ A remarkable upsurge in the complexity of molecules identified in the interstell
 		st.caption("ROI selection mode for cube generation: exact overlap only (nearest disabled).")
 		noise_scale = st.number_input("Noise scale", min_value=0.0, value=float(DEFAULT_NOISE_SCALE), step=0.1, format="%.3f")
 
-	tab_cube, tab_cube2 = st.tabs(["Cube Generator", "Simulate Single Spectrum"])
+	tab_cube, tab_cube2, tab_cube3 = st.tabs(["Cube Generator", "Simulate Single Spectrum", "Simulate Single Synthetic Spectrum"])
 
 	try:
 		syngen_path = _resolve_local_file("4.SYNGEN_Streamlit_v1.py")
@@ -2453,12 +2616,39 @@ A remarkable upsurge in the complexity of molecules identified in the interstell
 				with open(str(sel_cube_dl), "rb") as f_in:
 					cube_bytes = f_in.read()
 				st.download_button(
-					"Download selected cube (.fits)",
+					"Download selected observational cube (.fits)",
 					data=cube_bytes,
 					file_name=os.path.basename(str(sel_cube_dl)),
 					mime="application/fits",
-					key="p6_cube_download_button",
+					key="p6_cube_download_button_obs",
 				)
+
+				synth_cube_path = str(sel_cube_dl)[:-5] + "_SYNTHONLY.fits"
+				if os.path.isfile(synth_cube_path):
+					with open(synth_cube_path, "rb") as f_syn:
+						synth_bytes = f_syn.read()
+					st.download_button(
+						"Download synthetic cube (.fits)",
+						data=synth_bytes,
+						file_name=os.path.basename(str(synth_cube_path)),
+						mime="application/fits",
+						key="p6_cube_download_button_syn",
+					)
+				else:
+					st.caption("Synthetic cube file not found for selected observational cube.")
+
+				noise_bytes, noise_err = _build_noise_cube_bytes_from_pair(str(sel_cube_dl), str(synth_cube_path))
+				if (noise_bytes is not None) and (noise_err is None):
+					base_name = os.path.splitext(os.path.basename(str(sel_cube_dl)))[0]
+					st.download_button(
+						"Download noise cube (.fits) [observational - synthetic]",
+						data=noise_bytes,
+						file_name=f"{base_name}_NOISEONLY.fits",
+						mime="application/fits",
+						key="p6_cube_download_button_noise",
+					)
+				elif noise_err:
+					st.caption(f"Noise cube not available: {noise_err}")
 			except Exception as e:
 				st.error(f"Could not prepare cube download: {e}")
 		else:
@@ -2765,6 +2955,223 @@ A remarkable upsurge in the complexity of molecules identified in the interstell
 			st.caption("Auto-updating every 5 seconds...")
 			time.sleep(5)
 			st.rerun()
+
+	with tab_cube3:
+		st.subheader("Simulate Single Synthetic Spectrum | CH3OCHO")
+		st.caption("Same workflow as Simulate Single Spectrum, but using only synthetic-spectrum models (no noise models).")
+
+		st.markdown("**ROI explorer (signal and noise models)**")
+		if bool(st.session_state.get("p6_guide_cube3_refresh", False)):
+			st.session_state.p6_guide_freqs_cube3_input = str(st.session_state.get("p6_guide_freqs_cube3_pending", "")).strip()
+			st.session_state.p6_guide_cube3_refresh = False
+			st.session_state.p6_guide_freqs_cube3_pending = ""
+		if not str(st.session_state.get("p6_guide_freqs_cube3_input", "")).strip():
+			last_cube3 = str(st.session_state.get("p6_guide_freqs_cube3_last_nonempty", "")).strip()
+			if last_cube3:
+				st.session_state.p6_guide_freqs_cube3_input = last_cube3
+			else:
+				st.session_state.p6_guide_freqs_cube3_input = _freqs_to_text([float(v) for v in target_freqs])
+
+		guide_freqs_text3 = st.text_input(
+			"Guide frequencies (GHz; main list used for Generate Synthetic Spectrum)",
+			key="p6_guide_freqs_cube3_input",
+		)
+		if str(guide_freqs_text3).strip():
+			st.session_state.p6_guide_freqs_cube3_last_nonempty = str(guide_freqs_text3).strip()
+		guide_freqs3 = parse_freq_list(guide_freqs_text3)
+		guide_freq3 = float(guide_freqs3[0]) if len(guide_freqs3) > 0 else None
+
+		signal_rois3 = _collect_signal_rois_for_ui(signal_models_root, filter_file)
+		noise_rois3 = _collect_noise_rois_for_ui(noise_models_root)
+		signal_rois3, noise_rois3 = _mark_roi_overlaps(signal_rois3, noise_rois3)
+
+		if (not signal_rois3) and (not noise_rois3):
+			st.info("Could not load ROIs yet. Check model/filter paths.")
+		else:
+			if "p6_roi3_guide_prev" not in st.session_state:
+				st.session_state.p6_roi3_guide_prev = None
+			guide_key3 = tuple([round(float(v), 9) for v in guide_freqs3])
+			guide_changed3 = st.session_state.p6_roi3_guide_prev != guide_key3
+			if guide_changed3:
+				if signal_rois3:
+					st.session_state.p6_signal_roi_select3 = int(_pick_default_roi_index(signal_rois3, guide_freq3))
+				if noise_rois3:
+					st.session_state.p6_noise_roi_select3 = int(_pick_default_roi_index(noise_rois3, guide_freq3))
+				st.session_state.p6_roi3_guide_prev = guide_key3
+
+			if signal_rois3 and int(st.session_state.get("p6_signal_roi_select3", 0)) >= len(signal_rois3):
+				st.session_state.p6_signal_roi_select3 = 0
+			if noise_rois3 and int(st.session_state.get("p6_noise_roi_select3", 0)) >= len(noise_rois3):
+				st.session_state.p6_noise_roi_select3 = 0
+
+			c3_roi_1, c3_roi_2 = st.columns(2)
+			with c3_roi_1:
+				if signal_rois3:
+					sig_opts3 = list(range(len(signal_rois3)))
+					st.selectbox(
+						"Synthetic-model ROIs",
+						options=sig_opts3,
+						format_func=lambda i: (
+							f"ROI S{signal_rois3[i]['index']} | {signal_rois3[i]['lo']:.6f}–{signal_rois3[i]['hi']:.6f} GHz"
+							+ (
+								f" | MATCHED BETWEEN MODELS: N{',N'.join([str(v) for v in _get_overlapping_noise_roi_indices(signal_rois3[i], noise_rois3)])}"
+								if _get_overlapping_noise_roi_indices(signal_rois3[i], noise_rois3)
+								else " | no overlap"
+							)
+						),
+						key="p6_signal_roi_select3",
+					)
+				else:
+					st.caption("No signal ROIs available")
+
+			with c3_roi_2:
+				if noise_rois3:
+					noi_opts3 = list(range(len(noise_rois3)))
+					st.selectbox(
+						"Noise-model ROIs",
+						options=noi_opts3,
+						format_func=lambda i: (
+							f"ROI N{noise_rois3[i]['index']} | {noise_rois3[i]['lo']:.6f}–{noise_rois3[i]['hi']:.6f} GHz"
+							+ (
+								f" | MATCHED BETWEEN MODELS: S{',S'.join([str(v) for v in _get_overlapping_signal_roi_indices(noise_rois3[i], signal_rois3)])}"
+								if _get_overlapping_signal_roi_indices(noise_rois3[i], signal_rois3)
+								else " | no overlap"
+							)
+						),
+						key="p6_noise_roi_select3",
+					)
+				else:
+					st.caption("No noise ROIs available")
+
+			sel_sig_idx3 = None if not signal_rois3 else int(signal_rois3[int(st.session_state.get("p6_signal_roi_select3", 0))]["index"])
+			sel_noi_idx3 = None if not noise_rois3 else int(noise_rois3[int(st.session_state.get("p6_noise_roi_select3", 0))]["index"])
+			combo_freqs3 = _selected_roi_combo_freqs(
+				signal_rois=signal_rois3,
+				noise_rois=noise_rois3,
+				selected_signal_pos=int(st.session_state.get("p6_signal_roi_select3", 0)) if signal_rois3 else None,
+				selected_noise_pos=int(st.session_state.get("p6_noise_roi_select3", 0)) if noise_rois3 else None,
+			)
+			_plot_roi_overview(signal_rois3, noise_rois3, guide_freqs_ghz=guide_freqs3, selected_combo_freqs_ghz=combo_freqs3, selected_signal_index=sel_sig_idx3, selected_noise_index=sel_noi_idx3, chart_key="p6_roi_overview_cube3")
+
+		if st.button("Add selected ROI combination to Guide frequencies", key="p6_add_rois_to_guide_cube3"):
+			updated_freqs3 = _append_selected_rois_to_freq_list(
+				base_freqs=guide_freqs3,
+				signal_rois=signal_rois3,
+				noise_rois=noise_rois3,
+				selected_signal_pos=int(st.session_state.get("p6_signal_roi_select3", 0)) if signal_rois3 else None,
+				selected_noise_pos=int(st.session_state.get("p6_noise_roi_select3", 0)) if noise_rois3 else None,
+			)
+			st.session_state.p6_guide_freqs_cube3_pending = _freqs_to_text(updated_freqs3)
+			st.session_state.p6_guide_cube3_refresh = True
+			st.rerun()
+
+		guide_freqs_run3 = _normalize_target_freqs_for_run(parse_freq_list(str(st.session_state.get("p6_guide_freqs_cube3_input", ""))))
+		if guide_freqs_run3:
+			st.caption("Target frequencies used for Simulate Single Synthetic Spectrum: " + _freqs_to_text(guide_freqs_run3))
+		else:
+			st.caption("Target frequencies used for Simulate Single Synthetic Spectrum: (empty)")
+
+		p31, p32, p33, p34 = st.columns(4)
+		with p31:
+			logn_cube3 = st.number_input("LogN", value=18.248, format="%.4f", key="p6_cube3_logn")
+		with p32:
+			tex_cube3 = st.number_input("Tex", value=209.06, format="%.4f", key="p6_cube3_tex")
+		with p33:
+			fwhm_cube3 = st.number_input("FWHM", value=6.198, format="%.4f", key="p6_cube3_fwhm")
+		with p34:
+			velo_cube3 = st.number_input("Velocity", value=97.549, format="%.4f", key="p6_cube3_velo")
+
+		generate_synth_only = st.button("Generate Synthetic Spectrum", type="primary", key="p6_start_cube3")
+		if generate_synth_only:
+			if not guide_freqs_run3:
+				st.error("Guide frequencies está vacío. Agrega al menos una frecuencia o usa 'Add selected ROI combination to Guide frequencies'.")
+			elif not os.path.isfile(filter_file):
+				st.error(f"Filter file not found: {filter_file}")
+			elif (not signal_models_root) or ((not os.path.isfile(signal_models_root)) and (not os.path.isdir(signal_models_root))):
+				st.error("Signal models source invalid.")
+			else:
+				with st.spinner("Generating synthetic-only spectra..."):
+					res3, warn3 = _generate_synthetic_spectra_for_targets(
+						signal_models_source=str(signal_models_root),
+						filter_file=str(filter_file),
+						target_freqs=[float(v) for v in guide_freqs_run3],
+						x_features=[float(logn_cube3), float(tex_cube3), float(velo_cube3), float(fwhm_cube3)],
+						pred_mode=DEFAULT_PRED_MODE,
+						selected_model_name=DEFAULT_SELECTED_MODEL_NAME,
+						allow_nearest=bool(allow_nearest),
+					)
+				st.session_state.p6_synth_only_results = dict(res3)
+				st.session_state.p6_synth_only_warnings = list(warn3)
+				if res3:
+					st.success("Synthetic-only spectra generated.")
+				else:
+					st.warning("No synthetic spectra could be generated for the selected targets.")
+
+		uploaded_overlay = st.file_uploader(
+			"Upload synthetic spectrum (.txt/.dat/.csv) to overlay",
+			type=None,
+			key="p6_syn_only_upload_txt",
+		)
+		up_freq3, up_vals3, up_err3 = _read_uploaded_spectrum_any(uploaded_overlay) if uploaded_overlay is not None else (None, None, None)
+		if uploaded_overlay is not None and up_err3 is not None:
+			st.warning(f"Uploaded spectrum could not be parsed: {up_err3}")
+
+		results3 = st.session_state.get("p6_synth_only_results", {})
+		warns3 = st.session_state.get("p6_synth_only_warnings", [])
+		if isinstance(warns3, list) and warns3:
+			with st.expander("Show synthetic-only warnings"):
+				st.text("\n".join([str(w) for w in warns3]))
+
+		if isinstance(results3, dict) and results3:
+			keys3 = sorted(list(results3.keys()), key=lambda s: float(s))
+			st.markdown("**Synthetic-only spectra by target frequency**")
+			n_cols3 = 2 if len(keys3) <= 4 else 3
+			cols3 = st.columns(n_cols3)
+			for i_k, k3 in enumerate(keys3):
+				item3 = results3.get(k3, {})
+				f3 = np.asarray(item3.get("freq", []), dtype=np.float64)
+				y3 = np.asarray(item3.get("synthetic", []), dtype=np.float64)
+				with cols3[i_k % n_cols3]:
+					st.caption(f"target {float(item3.get('target_freq_ghz', float(k3))):.6f} GHz")
+					if f3.size == 0 or y3.size == 0:
+						st.caption("No data")
+						continue
+					fig3 = go.Figure()
+					fig3.add_trace(go.Scatter(x=f3, y=y3, mode="lines", name="Synthetic"))
+					if (up_freq3 is not None) and (up_vals3 is not None):
+						fig3.add_trace(go.Scatter(x=up_freq3, y=up_vals3, mode="lines", name="Uploaded synthetic", line=dict(dash="dot")))
+					fig3.update_layout(
+						xaxis_title="Frequency (GHz)",
+						yaxis_title="Intensity",
+						template="plotly_white",
+						height=380,
+						margin=dict(l=40, r=20, t=40, b=40),
+					)
+					st.plotly_chart(fig3, width="stretch", key=f"p6_synthonly_plot_{k3}")
+
+			with st.expander("Download spectrum (Simulate Single Synthetic Spectrum)"):
+				sel_key3 = st.selectbox(
+					"Select target frequency to export spectrum",
+					options=keys3,
+					format_func=lambda k: f"target {float(k):.6f} GHz",
+					key="p6_synthonly_download_select",
+				)
+				sel_item3 = results3.get(str(sel_key3), {})
+				f_dl3 = np.asarray(sel_item3.get("freq", []), dtype=np.float64)
+				y_dl3 = np.asarray(sel_item3.get("synthetic", []), dtype=np.float64)
+				txt_bytes3 = _synthetic_spectrum_to_txt_bytes(f_dl3, y_dl3)
+				if txt_bytes3 is None:
+					st.error("Could not serialize synthetic spectrum to TXT.")
+				else:
+					st.download_button(
+						"Download spectrum (.txt)",
+						data=txt_bytes3,
+						file_name=f"synthetic_target_{str(sel_key3).replace('.', 'p')}_spectrum.txt",
+						mime="text/plain",
+						key="p6_synthonly_download_button",
+					)
+		else:
+			st.caption("No synthetic spectra available yet.")
 
 
 def _worker_entry_if_needed() -> bool:
