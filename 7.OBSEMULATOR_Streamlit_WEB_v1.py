@@ -5,6 +5,7 @@ import io
 import json
 import time
 import glob
+import gc
 import hashlib
 import importlib.util
 import tempfile
@@ -2325,6 +2326,19 @@ def _ensure_state():
 		st.session_state.p6_fit_last_result = None
 
 
+def _clear_fitting_outputs():
+	# Clear previous fitting payload and any dynamic chart keys.
+	st.session_state.p6_fit_last_result = None
+	for k in list(st.session_state.keys()):
+		if str(k).startswith("p6_fit_plot_"):
+			st.session_state.pop(k, None)
+	st.session_state.pop("p6_fit_global_overlay_plot", None)
+	try:
+		gc.collect()
+	except Exception:
+		pass
+
+
 def _is_running() -> bool:
 	proc = st.session_state.get("cube_proc", None)
 	return proc is not None and proc.poll() is None
@@ -3869,8 +3883,8 @@ A remarkable upsurge in the complexity of molecules identified in the interstell
 
 		run_fit = st.button("Run fitting", type="primary", key="p6_run_fitting_btn")
 		if run_fit:
-			# Always clear previous fitting output before starting a new run
-			st.session_state.p6_fit_last_result = None
+			# Always clear previous fitting output/state before starting a new run
+			_clear_fitting_outputs()
 			if up_obs_fit is None or obs_freq_fit_used is None or obs_vals_fit_used is None:
 				st.error("Upload a valid observational spectrum first.")
 			elif not guide_freqs_fit:
