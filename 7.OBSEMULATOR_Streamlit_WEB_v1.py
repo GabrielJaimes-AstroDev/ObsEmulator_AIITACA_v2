@@ -3729,7 +3729,7 @@ A remarkable upsurge in the complexity of molecules identified in the interstell
 			st.error(f"Could not parse uploaded observational spectrum: {obs_err_fit}")
 
 		# Optional observational frequency shift (same spirit as 1.MODELS_Ana workflows)
-		obs_shift_enabled = st.checkbox("Apply observational frequency shift", value=False, key="p6_fit_shift_enabled")
+		obs_shift_enabled = st.checkbox("Apply observational frequency shift", value=True, key="p6_fit_shift_enabled")
 		obs_shift_mode = st.selectbox(
 			"Shift mode",
 			options=["per_frequency", "spw_center"],
@@ -3738,7 +3738,7 @@ A remarkable upsurge in the complexity of molecules identified in the interstell
 		)
 		obs_shift_kms = st.number_input(
 			"Observational shift (km/s)",
-			value=98.0,
+			value=-100.0,
 			step=0.1,
 			format="%.4f",
 			key="p6_fit_shift_kms",
@@ -3776,6 +3776,8 @@ A remarkable upsurge in the complexity of molecules identified in the interstell
 
 		run_fit = st.button("Run fitting", type="primary", key="p6_run_fitting_btn")
 		if run_fit:
+			# Always clear previous fitting output before starting a new run
+			st.session_state.p6_fit_last_result = None
 			if up_obs_fit is None or obs_freq_fit_used is None or obs_vals_fit_used is None:
 				st.error("Upload a valid observational spectrum first.")
 			elif not guide_freqs_fit:
