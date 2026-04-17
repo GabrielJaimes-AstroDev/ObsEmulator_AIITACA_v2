@@ -3924,14 +3924,14 @@ A remarkable upsurge in the complexity of molecules identified in the interstell
 								y=np.asarray(obs_vals_fit_used, dtype=np.float64),
 								mode="lines",
 								name="Observed (uploaded)",
-								line=dict(width=1.4),
+								line=dict(width=1.4, color="green"),
 							))
 						fig_global.add_trace(go.Scatter(
 							x=np.concatenate(f_cat),
 							y=np.concatenate(o_cat),
 							mode="lines",
 							name="Observed (ROI interp)",
-							line=dict(dash="dot", width=1.2),
+							line=dict(dash="dot", width=1.2, color="#2ca02c"),
 						))
 						fig_global.add_trace(go.Scatter(
 							x=np.concatenate(f_cat),
@@ -3969,7 +3969,7 @@ A remarkable upsurge in the complexity of molecules identified in the interstell
 						with cols_fit[i_pf % n_cols_fit]:
 							st.caption(f"target {float(pf.get('target_freq_ghz', np.nan)):.6f} GHz")
 							fig_fit = go.Figure()
-							fig_fit.add_trace(go.Scatter(x=fpf, y=yobs, mode="lines", name="Observed (interp)"))
+							fig_fit.add_trace(go.Scatter(x=fpf, y=yobs, mode="lines", name="Observed (interp)", line=dict(color="green")))
 							fig_fit.add_trace(go.Scatter(x=fpf, y=ys, mode="lines", name="Best synthetic", line=dict(dash="dash")))
 							if yn is not None:
 								fig_fit.add_trace(go.Scatter(x=fpf, y=np.asarray(yn, dtype=np.float64), mode="lines", name="Best noise", line=dict(dash="dot")))
