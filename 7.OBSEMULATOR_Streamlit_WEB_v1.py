@@ -2003,7 +2003,11 @@ def _run_roi_fitting(
 			except Exception:
 				continue
 		if not noise_models_loaded:
-			warnings_out.append("No valid noise models loaded. Falling back to synthetic-only fitting.")
+			return {
+				"ok": False,
+				"warnings": ["No valid noise models loaded for Case 2 (synthetic + noise)."],
+				"message": "Case 2 requires valid noise models. No fitting was performed.",
+			}
 
 	mae_acc = np.zeros((n,), dtype=np.float64)
 	roi_acc = np.zeros((n,), dtype=np.float64)
@@ -2028,18 +2032,28 @@ def _run_roi_fitting(
 				continue
 
 			y_eval = y_syn_batch
+			y_syn_eval = y_syn_batch
+			y_noise_eval_batch = None
+			roi_freq_eval = np.asarray(roi_freq, dtype=np.float64)
 			y_noise_best = None
 			if (str(case_mode).strip().lower() == "synthetic_plus_noise") and noise_models_loaded:
-				y_noise_batch, _ = _add_noise_batch_for_target(
+				y_noise_batch, noise_mask_batch = _add_noise_batch_for_target(
 					noise_models_loaded=noise_models_loaded,
 					roi_freq=roi_freq,
 					y_syn_batch=y_syn_batch,
 					x_candidates=X,
 					noise_scale=float(noise_scale),
 				)
-				y_eval = (y_syn_batch + y_noise_batch).astype(np.float32)
+				noise_channel_mask = np.any(np.asarray(noise_mask_batch, dtype=bool), axis=0)
+				if not np.any(noise_channel_mask):
+					warnings_out.append(f"target {tag} skipped: no overlapping noise ROI for this synthetic ROI")
+					continue
+				roi_freq_eval = np.asarray(roi_freq, dtype=np.float64)[noise_channel_mask]
+				y_syn_eval = np.asarray(y_syn_batch, dtype=np.float32)[:, noise_channel_mask]
+				y_noise_eval_batch = np.asarray(y_noise_batch, dtype=np.float32)[:, noise_channel_mask]
+				y_eval = (y_syn_eval + y_noise_eval_batch).astype(np.float32)
 
-			y_obs_roi = np.interp(roi_freq, np.asarray(obs_freq, dtype=np.float64), np.asarray(obs_intensity, dtype=np.float64), left=np.nan, right=np.nan)
+			y_obs_roi = np.interp(roi_freq_eval, np.asarray(obs_freq, dtype=np.float64), np.asarray(obs_intensity, dtype=np.float64), left=np.nan, right=np.nan)
 			valid = np.isfinite(y_obs_roi)
 			if int(np.count_nonzero(valid)) < 3:
 				warnings_out.append(f"target {tag} skipped: insufficient overlap with uploaded observational spectrum")
@@ -2055,7 +2069,7 @@ def _run_roi_fitting(
 
 			per_roi_rows.append({
 				"target_freq_ghz": float(tf),
-				"n_channels": int(roi_freq.size),
+				"n_channels": int(roi_freq_eval.size),
 				"n_overlap_points": int(np.count_nonzero(valid)),
 				"best_MAE": float(mae[best_i]),
 				"best_RMSE": float(rmse[best_i]),
@@ -2068,13 +2082,13 @@ def _run_roi_fitting(
 			})
 
 			if (str(case_mode).strip().lower() == "synthetic_plus_noise") and noise_models_loaded:
-				y_noise_best = (y_eval[best_i] - y_syn_batch[best_i]).astype(np.float64)
+				y_noise_best = (None if y_noise_eval_batch is None else np.asarray(y_noise_eval_batch[best_i], dtype=np.float64))
 
 			best_plot_payload.append({
 				"target_freq_ghz": float(tf),
-				"freq": np.asarray(roi_freq, dtype=np.float64),
+				"freq": np.asarray(roi_freq_eval, dtype=np.float64),
 				"obs_interp": np.asarray(y_obs_roi, dtype=np.float64),
-				"best_synthetic": np.asarray(y_syn_batch[best_i], dtype=np.float64),
+				"best_synthetic": np.asarray(y_syn_eval[best_i], dtype=np.float64),
 				"best_noise": (None if y_noise_best is None else np.asarray(y_noise_best, dtype=np.float64)),
 				"best_pred": np.asarray(y_eval[best_i], dtype=np.float64),
 				"best_idx": int(best_i),
@@ -2117,15 +2131,24 @@ def _run_roi_fitting(
 			y_pred_g = np.asarray(y_syn_g[0], dtype=np.float64)
 			y_noise_g = None
 			if (str(case_mode).strip().lower() == "synthetic_plus_noise") and noise_models_loaded:
-				y_noise_b, _ = _add_noise_batch_for_target(
+				y_noise_b, noise_mask_b = _add_noise_batch_for_target(
 					noise_models_loaded=noise_models_loaded,
 					roi_freq=roi_freq_g,
 					y_syn_batch=np.asarray(y_syn_g, dtype=np.float32),
 					x_candidates=x_best,
 					noise_scale=float(noise_scale),
 				)
-				y_noise_g = np.asarray(y_noise_b[0], dtype=np.float64)
-				y_pred_g = y_pred_g + y_noise_g
+				noise_channel_mask_g = np.any(np.asarray(noise_mask_b, dtype=bool), axis=0)
+				if not np.any(noise_channel_mask_g):
+					continue
+				roi_freq_g = np.asarray(roi_freq_g, dtype=np.float64)[noise_channel_mask_g]
+				y_syn_g = np.asarray(y_syn_g, dtype=np.float32)[:, noise_channel_mask_g]
+				y_noise_g = np.asarray(y_noise_b[0], dtype=np.float64)[noise_channel_mask_g]
+				y_pred_g = np.asarray(y_syn_g[0], dtype=np.float64) + y_noise_g
+ 
+			if (str(case_mode).strip().lower() != "synthetic_plus_noise"):
+				roi_freq_g = np.asarray(roi_freq_g, dtype=np.float64)
+				y_syn_g = np.asarray(y_syn_g, dtype=np.float32)
 
 			y_obs_g = np.interp(
 				roi_freq_g,
