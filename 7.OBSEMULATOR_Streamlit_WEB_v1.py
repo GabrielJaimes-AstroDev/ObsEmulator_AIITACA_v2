@@ -3103,6 +3103,71 @@ A remarkable upsurge in the complexity of molecules identified in the interstell
 
 		if isinstance(results3, dict) and results3:
 			keys3 = sorted(list(results3.keys()), key=lambda s: float(s))
+
+			# Global overview plot (always shown when synthetic results exist)
+			all_fmins: List[float] = []
+			all_fmaxs: List[float] = []
+			all_ymins: List[float] = []
+			all_ymaxs: List[float] = []
+			fig3_all = go.Figure()
+			for k3 in keys3:
+				it3 = results3.get(k3, {})
+				fg = np.asarray(it3.get("freq", []), dtype=np.float64)
+				yg = np.asarray(it3.get("synthetic", []), dtype=np.float64)
+				if fg.size == 0 or yg.size == 0:
+					continue
+				all_fmins.append(float(np.nanmin(fg)))
+				all_fmaxs.append(float(np.nanmax(fg)))
+				all_ymins.append(float(np.nanmin(yg)))
+				all_ymaxs.append(float(np.nanmax(yg)))
+				fig3_all.add_trace(
+					go.Scatter(
+						x=fg,
+						y=yg,
+						mode="lines",
+						name=f"Synthetic target {float(k3):.6f} GHz",
+					)
+				)
+
+			if (up_freq3 is not None) and (up_vals3 is not None):
+				all_fmins.append(float(np.nanmin(up_freq3)))
+				all_fmaxs.append(float(np.nanmax(up_freq3)))
+				all_ymins.append(float(np.nanmin(up_vals3)))
+				all_ymaxs.append(float(np.nanmax(up_vals3)))
+				fig3_all.add_trace(
+					go.Scatter(
+						x=up_freq3,
+						y=up_vals3,
+						mode="lines",
+						name="Uploaded synthetic",
+						line=dict(dash="dot", color="#444444"),
+					)
+				)
+
+			if all_fmins and all_fmaxs:
+				gx_min = float(np.nanmin(np.asarray(all_fmins, dtype=np.float64)))
+				gx_max = float(np.nanmax(np.asarray(all_fmaxs, dtype=np.float64)))
+				gx_span = float(max(1e-6, gx_max - gx_min))
+				gx_pad = float(max(5e-5, 0.06 * gx_span))
+				fig3_all.update_xaxes(range=[gx_min - gx_pad, gx_max + gx_pad])
+
+			if all_ymins and all_ymaxs:
+				gy_min = float(np.nanmin(np.asarray(all_ymins, dtype=np.float64)))
+				gy_max = float(np.nanmax(np.asarray(all_ymaxs, dtype=np.float64)))
+				gy_span = float(max(1e-8, gy_max - gy_min))
+				gy_pad = float(max(1e-6, 0.10 * gy_span))
+				fig3_all.update_yaxes(range=[gy_min - gy_pad, gy_max + gy_pad])
+
+			fig3_all.update_layout(
+				title="Global synthetic spectrum overview",
+				xaxis_title="Frequency (GHz)",
+				yaxis_title="Intensity",
+				template="plotly_white",
+				height=430,
+				margin=dict(l=40, r=20, t=50, b=40),
+			)
+			st.plotly_chart(fig3_all, width="stretch", key="p6_synthonly_global_plot")
+
 			st.markdown("**Synthetic-only spectra by target frequency**")
 			n_cols3 = 2 if len(keys3) <= 4 else 3
 			cols3 = st.columns(n_cols3)
@@ -3123,8 +3188,21 @@ A remarkable upsurge in the complexity of molecules identified in the interstell
 					fig3.add_trace(go.Scatter(x=f3, y=y3, mode="lines", name="Synthetic"))
 					if (up_freq3 is not None) and (up_vals3 is not None):
 						fig3.add_trace(go.Scatter(x=up_freq3, y=up_vals3, mode="lines", name="Uploaded synthetic", line=dict(dash="dot")))
+
+					y_min_local = float(np.nanmin(y3))
+					y_max_local = float(np.nanmax(y3))
+					if (up_freq3 is not None) and (up_vals3 is not None):
+						m_up = (np.asarray(up_freq3, dtype=np.float64) >= (fmin3 - pad3)) & (np.asarray(up_freq3, dtype=np.float64) <= (fmax3 + pad3))
+						if np.any(m_up):
+							y_up = np.asarray(up_vals3, dtype=np.float64)[m_up]
+							y_min_local = float(min(y_min_local, float(np.nanmin(y_up))))
+							y_max_local = float(max(y_max_local, float(np.nanmax(y_up))))
+					y_span_local = float(max(1e-8, y_max_local - y_min_local))
+					y_pad_local = float(max(1e-6, 0.12 * y_span_local))
+
 					fig3.update_layout(
 						xaxis=dict(range=[fmin3 - pad3, fmax3 + pad3]),
+						yaxis=dict(range=[y_min_local - y_pad_local, y_max_local + y_pad_local]),
 						xaxis_title="Frequency (GHz)",
 						yaxis_title="Intensity",
 						template="plotly_white",
