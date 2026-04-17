@@ -2377,6 +2377,8 @@ def _run_roi_fitting(
 	# Build global overlay using a single best parameter vector across all fitted ROIs
 	x_best = np.asarray(X[best_global_idx:best_global_idx + 1], dtype=np.float32)
 	global_overlay = []
+	global_per_roi_rows: List[dict] = []
+	global_plot_payload: List[dict] = []
 	for tf in [float(v) for v in (target_freqs or [])]:
 		tag = f"{float(tf):.6f}"
 		try:
@@ -2432,6 +2434,57 @@ def _run_roi_fitting(
 				],
 				max_points=2400,
 			)
+
+			# Per-ROI metrics using the single global-best parameter vector.
+			vg = np.isfinite(np.asarray(y_obs_g, dtype=np.float64)) & np.isfinite(np.asarray(y_pred_g, dtype=np.float64))
+			if int(np.count_nonzero(vg)) >= 3:
+				yt = np.asarray(y_obs_g, dtype=np.float64)[vg]
+				yp = np.asarray(y_pred_g, dtype=np.float64)[vg]
+				err = np.asarray(yp - yt, dtype=np.float64)
+				mae_g = float(np.mean(np.abs(err)))
+				rmse_g = float(np.sqrt(np.mean(err ** 2)))
+				den_g = float(np.sum((yt - float(np.mean(yt))) ** 2))
+				r2_g = (float(1.0 - (np.sum(err ** 2) / den_g)) if den_g > 0 else np.nan)
+				eps_g = float(max(1e-12, np.quantile(np.abs(yt), 0.1)))
+				chi_g = float(np.mean((err ** 2) / (np.abs(yt) + eps_g)))
+				if crit == "rmse":
+					obj_g = rmse_g
+				elif crit == "chi_like":
+					obj_g = chi_g
+				elif crit == "r2":
+					obj_g = -r2_g if np.isfinite(r2_g) else np.inf
+				else:
+					obj_g = mae_g
+
+				global_per_roi_rows.append({
+					"target_freq_ghz": float(tf),
+					"n_channels": int(np.asarray(roi_freq_g, dtype=np.float64).size),
+					"n_overlap_points": int(np.count_nonzero(vg)),
+					"best_MAE": float(mae_g),
+					"best_RMSE": float(rmse_g),
+					"best_R2": float(r2_g) if np.isfinite(float(r2_g)) else np.nan,
+					"best_CHI_like": float(chi_g),
+					"best_logN": float(X[best_global_idx, 0]),
+					"best_Tex": float(X[best_global_idx, 1]),
+					"best_Velocity": float(X[best_global_idx, 2]),
+					"best_FWHM": float(X[best_global_idx, 3]),
+					"criterion_used": str(crit),
+					"best_objective": float(obj_g),
+					"roi_weight_used": (np.nan if str(search_mode) == "concatenated" else 1.0),
+					"global_weight_mode": str(weighting_used),
+					"roi_weight_rule": "global_single_param_eval",
+				})
+
+				global_plot_payload.append({
+					"target_freq_ghz": float(tf),
+					"freq": ds_fg,
+					"obs_interp": ds_g[0],
+					"best_synthetic": ds_g[1],
+					"best_noise": ds_g[2],
+					"best_pred": ds_g[3],
+					"best_idx": int(best_global_idx),
+				})
+
 			global_overlay.append({
 				"target_freq_ghz": float(tf),
 				"freq": ds_fg,
@@ -2443,6 +2496,14 @@ def _run_roi_fitting(
 		except Exception:
 			warnings_out.append(f"target {tag} skipped in global overlay build")
 			continue
+
+	per_roi_out = per_roi_rows
+	plot_payload_out = best_plot_payload
+	if str(search_mode) == "concatenated":
+		if global_per_roi_rows:
+			per_roi_out = global_per_roi_rows
+		if global_plot_payload:
+			plot_payload_out = global_plot_payload
 
 	return {
 		"ok": True,
@@ -2461,9 +2522,9 @@ def _run_roi_fitting(
 		"candidate_mode": str(candidate_mode),
 		"best_global_mean_objective": float(global_obj[best_global_idx]),
 		"best_global_mean_MAE": float(global_mae[best_global_idx]),
-		"n_rois_fitted": int(len(per_roi_rows)),
-		"per_roi": per_roi_rows,
-		"plot_payload": best_plot_payload,
+		"n_rois_fitted": int(len(per_roi_out)),
+		"per_roi": per_roi_out,
+		"plot_payload": plot_payload_out,
 		"global_overlay": global_overlay,
 		"warnings": warnings_out,
 	}
