@@ -1850,14 +1850,39 @@ def _generate_synthetic_spectra_for_targets(
 	return results, warnings_out
 
 
-def _sample_fit_candidates(n_samples: int, ranges: dict, seed: int) -> np.ndarray:
+def _sample_fit_candidates(n_samples: int, ranges: dict, seed: int, mode: str = "random") -> np.ndarray:
 	n = int(max(1, n_samples))
-	rng = np.random.default_rng(int(seed))
-	logn = rng.uniform(float(ranges["logn_min"]), float(ranges["logn_max"]), size=n)
-	tex = rng.uniform(float(ranges["tex_min"]), float(ranges["tex_max"]), size=n)
-	velo = rng.uniform(float(ranges["velo_min"]), float(ranges["velo_max"]), size=n)
-	fwhm = rng.uniform(float(ranges["fwhm_min"]), float(ranges["fwhm_max"]), size=n)
-	X = np.stack([logn, tex, velo, fwhm], axis=1).astype(np.float32)
+	mode_norm = str(mode or "").strip().lower()
+
+	if mode_norm == "ordered_grid":
+		# Build a structured 4D grid and select evenly spaced points to keep exact n.
+		side = int(np.ceil(float(n) ** 0.25))
+		side = int(max(2, min(side, 64)))
+		grid_logn = np.linspace(float(ranges["logn_min"]), float(ranges["logn_max"]), num=side, dtype=np.float64)
+		grid_tex = np.linspace(float(ranges["tex_min"]), float(ranges["tex_max"]), num=side, dtype=np.float64)
+		grid_velo = np.linspace(float(ranges["velo_min"]), float(ranges["velo_max"]), num=side, dtype=np.float64)
+		grid_fwhm = np.linspace(float(ranges["fwhm_min"]), float(ranges["fwhm_max"]), num=side, dtype=np.float64)
+		g0, g1, g2, g3 = np.meshgrid(grid_logn, grid_tex, grid_velo, grid_fwhm, indexing="ij")
+		full = np.stack([g0.reshape(-1), g1.reshape(-1), g2.reshape(-1), g3.reshape(-1)], axis=1)
+		total = int(full.shape[0])
+		if total <= n:
+			X = full.astype(np.float32)
+		else:
+			idx = np.linspace(0, total - 1, num=n, dtype=np.int64)
+			idx = np.unique(idx)
+			if idx.size < n:
+				missing = int(n - idx.size)
+				pool = np.setdiff1d(np.arange(total, dtype=np.int64), idx, assume_unique=False)
+				idx = np.sort(np.concatenate([idx, pool[:missing]]))
+			X = full[idx].astype(np.float32)
+	else:
+		rng = np.random.default_rng(int(seed))
+		logn = rng.uniform(float(ranges["logn_min"]), float(ranges["logn_max"]), size=n)
+		tex = rng.uniform(float(ranges["tex_min"]), float(ranges["tex_max"]), size=n)
+		velo = rng.uniform(float(ranges["velo_min"]), float(ranges["velo_max"]), size=n)
+		fwhm = rng.uniform(float(ranges["fwhm_min"]), float(ranges["fwhm_max"]), size=n)
+		X = np.stack([logn, tex, velo, fwhm], axis=1).astype(np.float32)
+
 	# Ensure center candidate is present
 	X[0, 0] = 0.5 * (float(ranges["logn_min"]) + float(ranges["logn_max"]))
 	X[0, 1] = 0.5 * (float(ranges["tex_min"]) + float(ranges["tex_max"]))
@@ -1984,6 +2009,7 @@ def _run_roi_fitting(
 	case_mode: str,
 	fit_criterion: str,
 	global_weight_mode: str,
+	candidate_mode: str,
 	n_candidates: int,
 	ranges: dict,
 	noise_scale: float,
@@ -1997,7 +2023,12 @@ def _run_roi_fitting(
 	if weight_mode not in {"uniform", "overlap_points", "inverse_best_error"}:
 		weight_mode = "uniform"
 
-	X = _sample_fit_candidates(n_samples=int(n_candidates), ranges=ranges, seed=int(seed))
+	X = _sample_fit_candidates(
+		n_samples=int(n_candidates),
+		ranges=ranges,
+		seed=int(seed),
+		mode=str(candidate_mode),
+	)
 	n = int(X.shape[0])
 	pkg_cache: Dict[str, object] = {}
 	warnings_out: List[str] = []
@@ -2229,6 +2260,7 @@ def _run_roi_fitting(
 		},
 		"fit_criterion": str(crit),
 		"global_weight_mode": str(weight_mode),
+		"candidate_mode": str(candidate_mode),
 		"best_global_mean_objective": float(global_obj[best_global_idx]),
 		"best_global_mean_MAE": float(global_mae[best_global_idx]),
 		"n_rois_fitted": int(obj_mat.shape[0]),
@@ -3824,7 +3856,7 @@ A remarkable upsurge in the complexity of molecules identified in the interstell
 		)
 		obs_shift_kms = st.number_input(
 			"Observational shift (km/s)",
-			value=-100.0,
+			value=-98.0,
 			step=0.1,
 			format="%.4f",
 			key="p6_fit_shift_kms",
@@ -3843,9 +3875,19 @@ A remarkable upsurge in the complexity of molecules identified in the interstell
 			fit_criterion_ui = st.selectbox(
 				"Fitting criterion",
 				options=["MAE", "RMSE", "CHI_like", "R2"],
-				index=0,
+				index=2,
 				key="p6_fit_criterion",
 			)
+			fit_candidate_mode_ui = st.selectbox(
+				"Candidate generation",
+				options=["Smart ordered grid", "Random"],
+				index=0,
+				key="p6_fit_candidate_mode",
+			)
+			fit_candidate_mode_map = {
+				"Smart ordered grid": "ordered_grid",
+				"Random": "random",
+			}
 			fit_weight_mode_ui = st.selectbox(
 				"Global aggregation weighting",
 				options=[
@@ -3853,7 +3895,7 @@ A remarkable upsurge in the complexity of molecules identified in the interstell
 					"By overlap points per ROI",
 					"By ROI fit quality (inverse best error)",
 				],
-				index=0,
+				index=2,
 				key="p6_fit_weight_mode",
 			)
 			fit_weight_mode_map = {
@@ -3863,17 +3905,17 @@ A remarkable upsurge in the complexity of molecules identified in the interstell
 			}
 			cfr1, cfr2, cfr3, cfr4 = st.columns(4)
 			with cfr1:
-				fit_logn_min = st.number_input("logN min", value=12.0, key="p6_fit_logn_min")
+				fit_logn_min = st.number_input("logN min", value=14.0, key="p6_fit_logn_min")
 				fit_logn_max = st.number_input("logN max", value=19.5, key="p6_fit_logn_max")
 			with cfr2:
-				fit_tex_min = st.number_input("Tex min", value=20.0, key="p6_fit_tex_min")
+				fit_tex_min = st.number_input("Tex min", value=100.0, key="p6_fit_tex_min")
 				fit_tex_max = st.number_input("Tex max", value=380.0, key="p6_fit_tex_max")
 			with cfr3:
-				fit_velo_min = st.number_input("Velocity min", value=-5.0, key="p6_fit_velo_min")
+				fit_velo_min = st.number_input("Velocity min", value=90.0, key="p6_fit_velo_min")
 				fit_velo_max = st.number_input("Velocity max", value=105.0, key="p6_fit_velo_max")
 			with cfr4:
-				fit_fwhm_min = st.number_input("FWHM min", value=1.0, key="p6_fit_fwhm_min")
-				fit_fwhm_max = st.number_input("FWHM max", value=15.0, key="p6_fit_fwhm_max")
+				fit_fwhm_min = st.number_input("FWHM min", value=5.0, key="p6_fit_fwhm_min")
+				fit_fwhm_max = st.number_input("FWHM max", value=8.0, key="p6_fit_fwhm_max")
 
 			cfsp1, cfsp2 = st.columns(2)
 			with cfsp1:
@@ -3915,6 +3957,7 @@ A remarkable upsurge in the complexity of molecules identified in the interstell
 						case_mode=str(fit_case_mode),
 						fit_criterion=str(fit_criterion_ui).strip().lower(),
 						global_weight_mode=str(fit_weight_mode_map.get(str(fit_weight_mode_ui), "uniform")),
+						candidate_mode=str(fit_candidate_mode_map.get(str(fit_candidate_mode_ui), "ordered_grid")),
 						n_candidates=int(n_candidates_fit),
 						ranges=ranges_fit,
 						noise_scale=float(noise_scale),
@@ -3945,6 +3988,7 @@ A remarkable upsurge in the complexity of molecules identified in the interstell
 					f"Mode: {fit_result.get('case_mode', '')} | "
 					f"Candidates: {int(fit_result.get('n_candidates', 0))} | "
 					f"ROIs fitted: {int(fit_result.get('n_rois_fitted', 0))} | "
+					f"Sampling: {fit_result.get('candidate_mode', 'ordered_grid')} | "
 					f"Weighting: {fit_result.get('global_weight_mode', 'uniform')}"
 				)
 
