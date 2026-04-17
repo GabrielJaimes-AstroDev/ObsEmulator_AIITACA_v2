@@ -1953,8 +1953,8 @@ def _add_noise_batch_for_target(
 	noise_scale: float,
 ):
 	n_cand, n_chan = int(y_syn_batch.shape[0]), int(y_syn_batch.shape[1])
-	noise_sum = np.zeros((n_cand, n_chan), dtype=np.float64)
-	noise_cnt = np.zeros((n_cand, n_chan), dtype=np.float64)
+	noise_sum = np.zeros((n_cand, n_chan), dtype=np.float32)
+	noise_cnt = np.zeros((n_cand, n_chan), dtype=np.float32)
 	for noise_model, noise_scaler, noise_cfg in (noise_models_loaded or []):
 		segs = get_noise_segments_for_axis(noise_cfg, roi_freq)
 		for idx, spw_idx in segs:
@@ -1971,7 +1971,7 @@ def _add_noise_batch_for_target(
 					noise_scale=float(noise_scale),
 					batch_size=2048,
 				)
-				noise_sum[:, idx] += noise_seg.astype(np.float64)
+				noise_sum[:, idx] += noise_seg.astype(np.float32)
 				noise_cnt[:, idx] += 1.0
 			except Exception:
 				continue
@@ -1981,6 +1981,29 @@ def _add_noise_batch_for_target(
 	if np.any(m):
 		y_noise[m] = (noise_sum[m] / noise_cnt[m]).astype(np.float32)
 	return y_noise, m
+
+
+def _downsample_for_plot_arrays(freq: np.ndarray, arrays: List[Optional[np.ndarray]], max_points: int = 2400):
+	f = np.asarray(freq, dtype=np.float64).reshape(-1)
+	if f.size == 0:
+		return f, [None if a is None else np.asarray(a, dtype=np.float64).reshape(-1) for a in arrays]
+	max_p = int(max(16, max_points))
+	if f.size <= max_p:
+		return f, [None if a is None else np.asarray(a, dtype=np.float64).reshape(-1) for a in arrays]
+	idx = np.linspace(0, int(f.size) - 1, num=max_p, dtype=np.int64)
+	idx = np.unique(idx)
+	f_ds = f[idx]
+	arr_ds = []
+	for a in arrays:
+		if a is None:
+			arr_ds.append(None)
+			continue
+		av = np.asarray(a, dtype=np.float64).reshape(-1)
+		if av.size != f.size:
+			arr_ds.append(av)
+		else:
+			arr_ds.append(av[idx])
+	return f_ds, arr_ds
 
 
 def _vectorized_fit_metrics(y_true: np.ndarray, y_pred_batch: np.ndarray):
@@ -2055,65 +2078,128 @@ def _run_roi_fitting(
 	roi_weights: List[float] = []
 	per_roi_rows: List[dict] = []
 	best_plot_payload: List[dict] = []
+	fit_batch_size = int(max(128, min(1024, n)))
 
 	for tf in [float(v) for v in (target_freqs or [])]:
 		tag = f"{float(tf):.6f}"
 		try:
-			roi_freq, y_syn_batch, err = _predict_synthetic_batch_single_target(
-				signal_models_source=signal_models_source,
-				filter_file=filter_file,
-				target_freq_ghz=float(tf),
-				x_candidates=X,
-				pred_mode=DEFAULT_PRED_MODE,
-				selected_model_name=DEFAULT_SELECTED_MODEL_NAME,
-				allow_nearest=allow_nearest,
-				pkg_cache=pkg_cache,
-			)
-			if err is not None or roi_freq is None or y_syn_batch is None:
-				warnings_out.append(f"target {tag} skipped: {err if err else 'empty ROI prediction'}")
-				continue
+			mae_all = np.full((n,), np.inf, dtype=np.float64)
+			rmse_all = np.full((n,), np.inf, dtype=np.float64)
+			r2_all = np.full((n,), np.nan, dtype=np.float64)
+			chi_all = np.full((n,), np.inf, dtype=np.float64)
+			obj_all = np.full((n,), np.inf, dtype=np.float64)
 
-			y_eval = y_syn_batch
-			y_syn_eval = y_syn_batch
-			y_noise_eval_batch = None
-			roi_freq_eval = np.asarray(roi_freq, dtype=np.float64)
-			y_noise_best = None
-			if (str(case_mode).strip().lower() == "synthetic_plus_noise") and noise_models_loaded:
-				y_noise_batch, noise_mask_batch = _add_noise_batch_for_target(
-					noise_models_loaded=noise_models_loaded,
-					roi_freq=roi_freq,
-					y_syn_batch=y_syn_batch,
-					x_candidates=X,
-					noise_scale=float(noise_scale),
+			roi_freq_eval_ref = None
+			y_obs_roi_ref = None
+			valid_ref = None
+			best_i = None
+			best_obj = np.inf
+			best_syn = None
+			best_noise = None
+			best_pred = None
+			skip_target = False
+
+			for i0 in range(0, n, fit_batch_size):
+				i1 = int(min(i0 + fit_batch_size, n))
+				x_chunk = np.asarray(X[i0:i1], dtype=np.float32)
+
+				roi_freq, y_syn_batch, err = _predict_synthetic_batch_single_target(
+					signal_models_source=signal_models_source,
+					filter_file=filter_file,
+					target_freq_ghz=float(tf),
+					x_candidates=x_chunk,
+					pred_mode=DEFAULT_PRED_MODE,
+					selected_model_name=DEFAULT_SELECTED_MODEL_NAME,
+					allow_nearest=allow_nearest,
+					pkg_cache=pkg_cache,
 				)
-				noise_channel_mask = np.any(np.asarray(noise_mask_batch, dtype=bool), axis=0)
-				if not np.any(noise_channel_mask):
-					warnings_out.append(f"target {tag} skipped: no overlapping noise ROI for this synthetic ROI")
-					continue
-				roi_freq_eval = np.asarray(roi_freq, dtype=np.float64)[noise_channel_mask]
-				y_syn_eval = np.asarray(y_syn_batch, dtype=np.float32)[:, noise_channel_mask]
-				y_noise_eval_batch = np.asarray(y_noise_batch, dtype=np.float32)[:, noise_channel_mask]
-				y_eval = (y_syn_eval + y_noise_eval_batch).astype(np.float32)
+				if err is not None or roi_freq is None or y_syn_batch is None:
+					warnings_out.append(f"target {tag} skipped: {err if err else 'empty ROI prediction'}")
+					skip_target = True
+					break
 
-			y_obs_roi = np.interp(roi_freq_eval, np.asarray(obs_freq, dtype=np.float64), np.asarray(obs_intensity, dtype=np.float64), left=np.nan, right=np.nan)
-			valid = np.isfinite(y_obs_roi)
-			if int(np.count_nonzero(valid)) < 3:
-				warnings_out.append(f"target {tag} skipped: insufficient overlap with uploaded observational spectrum")
+				y_eval = y_syn_batch
+				y_syn_eval = y_syn_batch
+				y_noise_eval_batch = None
+				roi_freq_eval = np.asarray(roi_freq, dtype=np.float64)
+
+				if (str(case_mode).strip().lower() == "synthetic_plus_noise") and noise_models_loaded:
+					y_noise_batch, noise_mask_batch = _add_noise_batch_for_target(
+						noise_models_loaded=noise_models_loaded,
+						roi_freq=roi_freq,
+						y_syn_batch=y_syn_batch,
+						x_candidates=x_chunk,
+						noise_scale=float(noise_scale),
+					)
+					noise_channel_mask = np.any(np.asarray(noise_mask_batch, dtype=bool), axis=0)
+					if not np.any(noise_channel_mask):
+						warnings_out.append(f"target {tag} skipped: no overlapping noise ROI for this synthetic ROI")
+						skip_target = True
+						break
+					roi_freq_eval = np.asarray(roi_freq, dtype=np.float64)[noise_channel_mask]
+					y_syn_eval = np.asarray(y_syn_batch, dtype=np.float32)[:, noise_channel_mask]
+					y_noise_eval_batch = np.asarray(y_noise_batch, dtype=np.float32)[:, noise_channel_mask]
+					y_eval = (y_syn_eval + y_noise_eval_batch).astype(np.float32)
+
+				if roi_freq_eval_ref is None:
+					roi_freq_eval_ref = np.asarray(roi_freq_eval, dtype=np.float64)
+					y_obs_roi_ref = np.interp(
+						roi_freq_eval_ref,
+						np.asarray(obs_freq, dtype=np.float64),
+						np.asarray(obs_intensity, dtype=np.float64),
+						left=np.nan,
+						right=np.nan,
+					)
+					valid_ref = np.isfinite(y_obs_roi_ref)
+					if int(np.count_nonzero(valid_ref)) < 3:
+						warnings_out.append(f"target {tag} skipped: insufficient overlap with uploaded observational spectrum")
+						skip_target = True
+						break
+				else:
+					if int(np.asarray(roi_freq_eval, dtype=np.float64).size) != int(np.asarray(roi_freq_eval_ref, dtype=np.float64).size):
+						warnings_out.append(f"target {tag} skipped: inconsistent ROI channel count across candidate chunks")
+						skip_target = True
+						break
+
+				y_true = np.asarray(y_obs_roi_ref[valid_ref], dtype=np.float64)
+				y_pred_batch = np.asarray(y_eval[:, valid_ref], dtype=np.float64)
+				mae, rmse, r2, chi_like = _vectorized_fit_metrics(y_true, y_pred_batch)
+				if crit == "rmse":
+					obj = np.asarray(rmse, dtype=np.float64)
+				elif crit == "chi_like":
+					obj = np.asarray(chi_like, dtype=np.float64)
+				elif crit == "r2":
+					obj = -np.asarray(r2, dtype=np.float64)
+				else:
+					obj = np.asarray(mae, dtype=np.float64)
+				obj[~np.isfinite(obj)] = np.inf
+
+				mae_all[i0:i1] = np.asarray(mae, dtype=np.float64)
+				rmse_all[i0:i1] = np.asarray(rmse, dtype=np.float64)
+				r2_all[i0:i1] = np.asarray(r2, dtype=np.float64)
+				chi_all[i0:i1] = np.asarray(chi_like, dtype=np.float64)
+				obj_all[i0:i1] = np.asarray(obj, dtype=np.float64)
+
+				loc = int(np.argmin(obj))
+				loc_obj = float(obj[loc])
+				if np.isfinite(loc_obj) and loc_obj < float(best_obj):
+					best_obj = float(loc_obj)
+					best_i = int(i0 + loc)
+					best_syn = np.asarray(y_syn_eval[loc], dtype=np.float64)
+					best_noise = (None if y_noise_eval_batch is None else np.asarray(y_noise_eval_batch[loc], dtype=np.float64))
+					best_pred = np.asarray(y_eval[loc], dtype=np.float64)
+
+			if skip_target or (best_i is None) or (roi_freq_eval_ref is None) or (y_obs_roi_ref is None) or (valid_ref is None):
 				continue
 
-			y_true = np.asarray(y_obs_roi[valid], dtype=np.float64)
-			y_pred_batch = np.asarray(y_eval[:, valid], dtype=np.float64)
-			mae, rmse, r2, chi_like = _vectorized_fit_metrics(y_true, y_pred_batch)
-			if crit == "rmse":
-				obj = np.asarray(rmse, dtype=np.float64)
-			elif crit == "chi_like":
-				obj = np.asarray(chi_like, dtype=np.float64)
-			elif crit == "r2":
-				obj = -np.asarray(r2, dtype=np.float64)
-			else:
-				obj = np.asarray(mae, dtype=np.float64)
-			obj[~np.isfinite(obj)] = np.inf
-			best_i = int(np.argmin(obj))
+			obj = np.asarray(obj_all, dtype=np.float64)
+			mae = np.asarray(mae_all, dtype=np.float64)
+			rmse = np.asarray(rmse_all, dtype=np.float64)
+			r2 = np.asarray(r2_all, dtype=np.float64)
+			chi_like = np.asarray(chi_all, dtype=np.float64)
+			roi_freq_eval = np.asarray(roi_freq_eval_ref, dtype=np.float64)
+			y_obs_roi = np.asarray(y_obs_roi_ref, dtype=np.float64)
+			valid = np.asarray(valid_ref, dtype=bool)
 
 			best_error_for_weight = float(obj[best_i])
 			if crit == "r2":
@@ -2151,16 +2237,24 @@ def _run_roi_fitting(
 				"global_weight_mode": str(weight_mode),
 			})
 
-			if (str(case_mode).strip().lower() == "synthetic_plus_noise") and noise_models_loaded:
-				y_noise_best = (None if y_noise_eval_batch is None else np.asarray(y_noise_eval_batch[best_i], dtype=np.float64))
+			ds_freq, ds_arrays = _downsample_for_plot_arrays(
+				np.asarray(roi_freq_eval, dtype=np.float64),
+				[
+					np.asarray(y_obs_roi, dtype=np.float64),
+					(None if best_syn is None else np.asarray(best_syn, dtype=np.float64)),
+					(None if best_noise is None else np.asarray(best_noise, dtype=np.float64)),
+					(None if best_pred is None else np.asarray(best_pred, dtype=np.float64)),
+				],
+				max_points=2400,
+			)
 
 			best_plot_payload.append({
 				"target_freq_ghz": float(tf),
-				"freq": np.asarray(roi_freq_eval, dtype=np.float64),
-				"obs_interp": np.asarray(y_obs_roi, dtype=np.float64),
-				"best_synthetic": np.asarray(y_syn_eval[best_i], dtype=np.float64),
-				"best_noise": (None if y_noise_best is None else np.asarray(y_noise_best, dtype=np.float64)),
-				"best_pred": np.asarray(y_eval[best_i], dtype=np.float64),
+				"freq": ds_freq,
+				"obs_interp": ds_arrays[0],
+				"best_synthetic": ds_arrays[1],
+				"best_noise": ds_arrays[2],
+				"best_pred": ds_arrays[3],
 				"best_idx": int(best_i),
 			})
 		except Exception as e:
@@ -2235,13 +2329,23 @@ def _run_roi_fitting(
 				left=np.nan,
 				right=np.nan,
 			)
+			ds_fg, ds_g = _downsample_for_plot_arrays(
+				np.asarray(roi_freq_g, dtype=np.float64),
+				[
+					np.asarray(y_obs_g, dtype=np.float64),
+					np.asarray(y_syn_g[0], dtype=np.float64),
+					(None if y_noise_g is None else np.asarray(y_noise_g, dtype=np.float64)),
+					np.asarray(y_pred_g, dtype=np.float64),
+				],
+				max_points=2400,
+			)
 			global_overlay.append({
 				"target_freq_ghz": float(tf),
-				"freq": np.asarray(roi_freq_g, dtype=np.float64),
-				"obs_interp": np.asarray(y_obs_g, dtype=np.float64),
-				"best_global_synthetic": np.asarray(y_syn_g[0], dtype=np.float64),
-				"best_global_noise": (None if y_noise_g is None else np.asarray(y_noise_g, dtype=np.float64)),
-				"best_global_pred": np.asarray(y_pred_g, dtype=np.float64),
+				"freq": ds_fg,
+				"obs_interp": ds_g[0],
+				"best_global_synthetic": ds_g[1],
+				"best_global_noise": ds_g[2],
+				"best_global_pred": ds_g[3],
 			})
 		except Exception:
 			warnings_out.append(f"target {tag} skipped in global overlay build")
