@@ -2036,6 +2036,30 @@ def _vectorized_fit_metrics(y_true: np.ndarray, y_pred_batch: np.ndarray):
 	return mae.astype(np.float64), rmse.astype(np.float64), r2.astype(np.float64), chi_like.astype(np.float64)
 
 
+def _criterion_aware_roi_quality_weight(
+	criterion: str,
+	best_mae: float,
+	best_rmse: float,
+	best_chi_like: float,
+	best_r2: float,
+) -> float:
+	crit = str(criterion).strip().lower()
+	if crit == "rmse":
+		err = float(abs(best_rmse))
+		return float(np.clip(1.0 / max(err, 1e-12), 1e-6, 1e6))
+	if crit == "chi_like":
+		err = float(abs(best_chi_like))
+		return float(np.clip(1.0 / max(err, 1e-12), 1e-6, 1e6))
+	if crit == "r2":
+		r2v = float(best_r2) if np.isfinite(best_r2) else -1.0
+		# R2 higher is better: map [-1, +1] to [0, 1] and clip.
+		qual = 0.5 * (r2v + 1.0)
+		return float(np.clip(qual, 1e-6, 1.0))
+	# Default MAE-like behavior (lower is better).
+	err = float(abs(best_mae))
+	return float(np.clip(1.0 / max(err, 1e-12), 1e-6, 1e6))
+
+
 def _run_roi_fitting(
 	signal_models_source: str,
 	noise_models_root: str,
@@ -2046,6 +2070,7 @@ def _run_roi_fitting(
 	case_mode: str,
 	fit_criterion: str,
 	global_weight_mode: str,
+	global_search_mode: str,
 	candidate_mode: str,
 	n_candidates: int,
 	ranges: dict,
@@ -2059,6 +2084,9 @@ def _run_roi_fitting(
 	weight_mode = str(global_weight_mode).strip().lower()
 	if weight_mode not in {"uniform", "overlap_points", "inverse_best_error"}:
 		weight_mode = "uniform"
+	search_mode = str(global_search_mode).strip().lower()
+	if search_mode not in {"per_roi", "concatenated"}:
+		search_mode = "per_roi"
 
 	X = _sample_fit_candidates(
 		n_samples=int(n_candidates),
@@ -2093,6 +2121,13 @@ def _run_roi_fitting(
 	per_roi_rows: List[dict] = []
 	best_plot_payload: List[dict] = []
 	fit_batch_size = int(max(128, min(1024, n)))
+
+	concat_count = 0
+	concat_sum_y = 0.0
+	concat_sum_y2 = 0.0
+	concat_abs_err = np.zeros((n,), dtype=np.float64)
+	concat_sq_err = np.zeros((n,), dtype=np.float64)
+	concat_chi_term = np.zeros((n,), dtype=np.float64)
 
 	for tf in [float(v) for v in (target_freqs or [])]:
 		tag = f"{float(tf):.6f}"
@@ -2215,17 +2250,31 @@ def _run_roi_fitting(
 			y_obs_roi = np.asarray(y_obs_roi_ref, dtype=np.float64)
 			valid = np.asarray(valid_ref, dtype=bool)
 
-			best_error_for_weight = float(obj[best_i])
-			if crit == "r2":
-				best_error_for_weight = float(max(1.0 - float(r2[best_i]), 1e-12))
-			if (not np.isfinite(best_error_for_weight)) or (best_error_for_weight <= 0.0):
-				best_error_for_weight = 1.0
+			y_true = np.asarray(y_obs_roi[valid], dtype=np.float64)
+			# Accumulate concatenated global metrics across ROIs for all candidates.
+			# Summary-by-candidate accumulation for concatenated mode (independent of ROI weighting).
+			# Use current ROI candidate predictions available through the objective vectors:
+			# mae = mean(|err|), rmse = sqrt(mean(err^2)), chi_like = mean(err^2/(|y|+eps)).
+			n_pts_roi = int(y_true.size)
+			if n_pts_roi > 0:
+				concat_count += int(n_pts_roi)
+				concat_sum_y += float(np.sum(y_true))
+				concat_sum_y2 += float(np.sum(y_true ** 2))
+				concat_abs_err += np.asarray(mae, dtype=np.float64) * float(n_pts_roi)
+				concat_sq_err += (np.asarray(rmse, dtype=np.float64) ** 2) * float(n_pts_roi)
+				concat_chi_term += np.asarray(chi_like, dtype=np.float64) * float(n_pts_roi)
 
 			roi_n_overlap = int(np.count_nonzero(valid))
 			if weight_mode == "overlap_points":
 				roi_weight = float(max(roi_n_overlap, 1))
 			elif weight_mode == "inverse_best_error":
-				roi_weight = float(np.clip(1.0 / best_error_for_weight, 1e-6, 1e6))
+				roi_weight = _criterion_aware_roi_quality_weight(
+					criterion=str(crit),
+					best_mae=float(mae[best_i]),
+					best_rmse=float(rmse[best_i]),
+					best_chi_like=float(chi_like[best_i]),
+					best_r2=float(r2[best_i]) if np.isfinite(float(r2[best_i])) else np.nan,
+				)
 			else:
 				roi_weight = 1.0
 
@@ -2249,6 +2298,7 @@ def _run_roi_fitting(
 				"best_objective": float(obj[best_i]),
 				"roi_weight_used": float(roi_weight),
 				"global_weight_mode": str(weight_mode),
+				"roi_weight_rule": ("criterion_aware" if str(weight_mode) == "inverse_best_error" else "fixed"),
 			})
 
 			ds_freq, ds_arrays = _downsample_for_plot_arrays(
@@ -2282,18 +2332,47 @@ def _run_roi_fitting(
 			"message": "No ROI could be fitted against uploaded spectrum.",
 		}
 
-	obj_mat = np.vstack(objective_rows).astype(np.float64)
-	mae_mat = np.vstack(mae_rows).astype(np.float64)
-	w = np.asarray(roi_weights, dtype=np.float64)
-	w[~np.isfinite(w)] = 0.0
-	w = np.clip(w, 0.0, np.inf)
-	if float(np.sum(w)) <= 0.0:
-		w = np.ones_like(w, dtype=np.float64)
+	if search_mode == "concatenated":
+		if int(concat_count) <= 0:
+			return {
+				"ok": False,
+				"warnings": warnings_out,
+				"message": "No valid concatenated ROI points available for global fitting.",
+			}
+		global_mae = (np.asarray(concat_abs_err, dtype=np.float64) / float(concat_count)).astype(np.float64)
+		global_rmse = np.sqrt(np.asarray(concat_sq_err, dtype=np.float64) / float(concat_count)).astype(np.float64)
+		global_chi = (np.asarray(concat_chi_term, dtype=np.float64) / float(concat_count)).astype(np.float64)
+		mean_y = float(concat_sum_y) / float(concat_count)
+		sst = float(concat_sum_y2 - 2.0 * mean_y * concat_sum_y + float(concat_count) * (mean_y ** 2))
+		if sst > 0.0:
+			global_r2 = 1.0 - (np.asarray(concat_sq_err, dtype=np.float64) / float(sst))
+		else:
+			global_r2 = np.full((n,), np.nan, dtype=np.float64)
 
-	global_obj = np.average(obj_mat, axis=0, weights=w).astype(np.float64)
-	best_global_idx = int(np.nanargmin(global_obj))
+		if crit == "rmse":
+			global_obj = np.asarray(global_rmse, dtype=np.float64)
+		elif crit == "chi_like":
+			global_obj = np.asarray(global_chi, dtype=np.float64)
+		elif crit == "r2":
+			global_obj = -np.asarray(global_r2, dtype=np.float64)
+		else:
+			global_obj = np.asarray(global_mae, dtype=np.float64)
+		global_obj[~np.isfinite(global_obj)] = np.inf
+		best_global_idx = int(np.argmin(global_obj))
+		weighting_used = "not_used_in_concatenated_mode"
+	else:
+		obj_mat = np.vstack(objective_rows).astype(np.float64)
+		mae_mat = np.vstack(mae_rows).astype(np.float64)
+		w = np.asarray(roi_weights, dtype=np.float64)
+		w[~np.isfinite(w)] = 0.0
+		w = np.clip(w, 0.0, np.inf)
+		if float(np.sum(w)) <= 0.0:
+			w = np.ones_like(w, dtype=np.float64)
 
-	global_mae = np.average(mae_mat, axis=0, weights=w).astype(np.float64)
+		global_obj = np.average(obj_mat, axis=0, weights=w).astype(np.float64)
+		best_global_idx = int(np.nanargmin(global_obj))
+		global_mae = np.average(mae_mat, axis=0, weights=w).astype(np.float64)
+		weighting_used = str(weight_mode)
 
 	# Build global overlay using a single best parameter vector across all fitted ROIs
 	x_best = np.asarray(X[best_global_idx:best_global_idx + 1], dtype=np.float32)
@@ -2368,6 +2447,7 @@ def _run_roi_fitting(
 	return {
 		"ok": True,
 		"case_mode": str(case_mode),
+		"global_search_mode": str(search_mode),
 		"n_candidates": int(n),
 		"best_global_index": int(best_global_idx),
 		"best_global_params": {
@@ -2377,11 +2457,11 @@ def _run_roi_fitting(
 			"FWHM": float(X[best_global_idx, 3]),
 		},
 		"fit_criterion": str(crit),
-		"global_weight_mode": str(weight_mode),
+		"global_weight_mode": str(weighting_used),
 		"candidate_mode": str(candidate_mode),
 		"best_global_mean_objective": float(global_obj[best_global_idx]),
 		"best_global_mean_MAE": float(global_mae[best_global_idx]),
-		"n_rois_fitted": int(obj_mat.shape[0]),
+		"n_rois_fitted": int(len(per_roi_rows)),
 		"per_roi": per_roi_rows,
 		"plot_payload": best_plot_payload,
 		"global_overlay": global_overlay,
@@ -4025,6 +4105,16 @@ A remarkable upsurge in the complexity of molecules identified in the interstell
 			st.caption(f"Observational spectrum shifted by {float(obs_shift_kms):+.4f} km/s using mode: {str(obs_shift_mode)}")
 
 		with st.expander("Fitting search ranges and speed settings", expanded=False):
+			fit_global_mode_ui = st.selectbox(
+				"Global fit strategy",
+				options=["Per-ROI aggregate", "Concatenated ROIs (single objective)"],
+				index=0,
+				key="p6_fit_global_mode",
+			)
+			fit_global_mode_map = {
+				"Per-ROI aggregate": "per_roi",
+				"Concatenated ROIs (single objective)": "concatenated",
+			}
 			fit_criterion_ui = st.selectbox(
 				"Fitting criterion",
 				options=["MAE", "RMSE", "CHI_like", "R2"],
@@ -4052,7 +4142,7 @@ A remarkable upsurge in the complexity of molecules identified in the interstell
 				options=[
 					"Uniform (all ROIs equal)",
 					"By overlap points per ROI",
-					"By ROI fit quality (inverse best error)",
+					"By ROI fit quality (criterion-aware)",
 				],
 				index=2,
 				key="p6_fit_weight_mode",
@@ -4061,6 +4151,7 @@ A remarkable upsurge in the complexity of molecules identified in the interstell
 				"Uniform (all ROIs equal)": "uniform",
 				"By overlap points per ROI": "overlap_points",
 				"By ROI fit quality (inverse best error)": "inverse_best_error",
+				"By ROI fit quality (criterion-aware)": "inverse_best_error",
 			}
 			cfr1, cfr2, cfr3, cfr4 = st.columns(4)
 			with cfr1:
@@ -4116,6 +4207,7 @@ A remarkable upsurge in the complexity of molecules identified in the interstell
 						case_mode=str(fit_case_mode),
 						fit_criterion=str(fit_criterion_ui).strip().lower(),
 						global_weight_mode=str(fit_weight_mode_map.get(str(fit_weight_mode_ui), "uniform")),
+						global_search_mode=str(fit_global_mode_map.get(str(fit_global_mode_ui), "per_roi")),
 						candidate_mode=str(fit_candidate_mode_map.get(str(fit_candidate_mode_ui), "random")),
 						n_candidates=int(n_candidates_fit),
 						ranges=ranges_fit,
@@ -4145,6 +4237,7 @@ A remarkable upsurge in the complexity of molecules identified in the interstell
 				)
 				st.caption(
 					f"Mode: {fit_result.get('case_mode', '')} | "
+					f"Global strategy: {fit_result.get('global_search_mode', 'per_roi')} | "
 					f"Candidates: {int(fit_result.get('n_candidates', 0))} | "
 					f"ROIs fitted: {int(fit_result.get('n_rois_fitted', 0))} | "
 					f"Sampling: {fit_result.get('candidate_mode', 'ordered_grid')} | "
