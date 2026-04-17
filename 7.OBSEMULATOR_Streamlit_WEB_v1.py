@@ -1752,6 +1752,20 @@ def _read_uploaded_spectrum_any(upload_obj):
 	return f[ord_idx], y[ord_idx], None
 
 
+def _uploaded_file_signature(upload_obj) -> str:
+	if upload_obj is None:
+		return ""
+	try:
+		raw = upload_obj.getvalue()
+		name = str(getattr(upload_obj, "name", ""))
+		if raw is None:
+			return f"{name}|0"
+		h = hashlib.md5(bytes(raw)).hexdigest()
+		return f"{name}|{len(raw)}|{h}"
+	except Exception:
+		return str(getattr(upload_obj, "name", ""))
+
+
 def _build_noise_cube_bytes_from_pair(final_fits_path: str, synth_fits_path: str):
 	if fits is None:
 		return None, "FITS backend not available"
@@ -2460,6 +2474,10 @@ def _ensure_state():
 		st.session_state.p6_guide_freqs_fit_last_nonempty = ""
 	if "p6_fit_last_result" not in st.session_state:
 		st.session_state.p6_fit_last_result = None
+	if "p6_fit_upload_signature" not in st.session_state:
+		st.session_state.p6_fit_upload_signature = ""
+	if "p6_fit_sources_signature" not in st.session_state:
+		st.session_state.p6_fit_sources_signature = ""
 
 
 def _clear_fitting_outputs():
@@ -2845,6 +2863,17 @@ A remarkable upsurge in the complexity of molecules identified in the interstell
 		st.caption(f"Signal source in use: {signal_models_root}")
 		st.caption(f"Noise source in use: {noise_models_root}")
 		st.caption(f"Filter file in use: {filter_file}")
+
+		# If model/filter sources change, clear fitting outputs to avoid stale state.
+		sources_sig = "|".join([
+			str(signal_models_root or ""),
+			str(noise_models_root or ""),
+			str(filter_file or ""),
+		])
+		prev_sources_sig = str(st.session_state.get("p6_fit_sources_signature", ""))
+		if prev_sources_sig and (prev_sources_sig != sources_sig):
+			_clear_fitting_outputs()
+		st.session_state.p6_fit_sources_signature = str(sources_sig)
 
 		target_text = st.text_area("Default target frequencies (GHz)", value=", ".join([str(v) for v in DEFAULT_TARGET_FREQS]), height=120)
 		target_freqs = parse_freq_list(target_text)
@@ -3957,6 +3986,13 @@ A remarkable upsurge in the complexity of molecules identified in the interstell
 			type=None,
 			key="p6_fit_upload_obs",
 		)
+		current_upload_sig = _uploaded_file_signature(up_obs_fit)
+		prev_upload_sig = str(st.session_state.get("p6_fit_upload_signature", ""))
+		if prev_upload_sig and (prev_upload_sig != current_upload_sig):
+			_clear_fitting_outputs()
+			st.info("New observational file detected: previous fitting outputs were cleared.")
+		st.session_state.p6_fit_upload_signature = str(current_upload_sig)
+
 		obs_freq_fit, obs_vals_fit, obs_err_fit = _read_uploaded_spectrum_any(up_obs_fit) if up_obs_fit is not None else (None, None, None)
 		if up_obs_fit is not None and obs_err_fit is not None:
 			st.error(f"Could not parse uploaded observational spectrum: {obs_err_fit}")
