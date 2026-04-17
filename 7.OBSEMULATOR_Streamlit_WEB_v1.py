@@ -1982,6 +1982,7 @@ def _run_roi_fitting(
 	obs_intensity: np.ndarray,
 	case_mode: str,
 	fit_criterion: str,
+	global_weight_mode: str,
 	n_candidates: int,
 	ranges: dict,
 	noise_scale: float,
@@ -1991,6 +1992,9 @@ def _run_roi_fitting(
 	crit = str(fit_criterion).strip().lower()
 	if crit not in {"mae", "rmse", "chi_like", "r2"}:
 		crit = "mae"
+	weight_mode = str(global_weight_mode).strip().lower()
+	if weight_mode not in {"uniform", "overlap_points", "inverse_best_error"}:
+		weight_mode = "uniform"
 
 	X = _sample_fit_candidates(n_samples=int(n_candidates), ranges=ranges, seed=int(seed))
 	n = int(X.shape[0])
@@ -2014,9 +2018,9 @@ def _run_roi_fitting(
 				"message": "Case 2 requires valid noise models. No fitting was performed.",
 			}
 
-	mae_acc = np.zeros((n,), dtype=np.float64)
-	objective_acc = np.zeros((n,), dtype=np.float64)
-	roi_acc = np.zeros((n,), dtype=np.float64)
+	objective_rows: List[np.ndarray] = []
+	mae_rows: List[np.ndarray] = []
+	roi_weights: List[float] = []
 	per_roi_rows: List[dict] = []
 	best_plot_payload: List[dict] = []
 
@@ -2079,14 +2083,28 @@ def _run_roi_fitting(
 			obj[~np.isfinite(obj)] = np.inf
 			best_i = int(np.argmin(obj))
 
-			mae_acc += mae
-			objective_acc += obj
-			roi_acc += 1.0
+			best_error_for_weight = float(obj[best_i])
+			if crit == "r2":
+				best_error_for_weight = float(max(1.0 - float(r2[best_i]), 1e-12))
+			if (not np.isfinite(best_error_for_weight)) or (best_error_for_weight <= 0.0):
+				best_error_for_weight = 1.0
+
+			roi_n_overlap = int(np.count_nonzero(valid))
+			if weight_mode == "overlap_points":
+				roi_weight = float(max(roi_n_overlap, 1))
+			elif weight_mode == "inverse_best_error":
+				roi_weight = float(np.clip(1.0 / best_error_for_weight, 1e-6, 1e6))
+			else:
+				roi_weight = 1.0
+
+			objective_rows.append(np.asarray(obj, dtype=np.float64))
+			mae_rows.append(np.asarray(mae, dtype=np.float64))
+			roi_weights.append(float(roi_weight))
 
 			per_roi_rows.append({
 				"target_freq_ghz": float(tf),
 				"n_channels": int(roi_freq_eval.size),
-				"n_overlap_points": int(np.count_nonzero(valid)),
+				"n_overlap_points": int(roi_n_overlap),
 				"best_MAE": float(mae[best_i]),
 				"best_RMSE": float(rmse[best_i]),
 				"best_R2": float(r2[best_i]) if np.isfinite(float(r2[best_i])) else np.nan,
@@ -2097,6 +2115,8 @@ def _run_roi_fitting(
 				"best_FWHM": float(X[best_i, 3]),
 				"criterion_used": str(crit),
 				"best_objective": float(obj[best_i]),
+				"roi_weight_used": float(roi_weight),
+				"global_weight_mode": str(weight_mode),
 			})
 
 			if (str(case_mode).strip().lower() == "synthetic_plus_noise") and noise_models_loaded:
@@ -2115,20 +2135,25 @@ def _run_roi_fitting(
 			warnings_out.append(f"target {tag} skipped: {e}")
 			continue
 
-	valid_global = roi_acc > 0
-	if not np.any(valid_global):
+	if not objective_rows:
 		return {
 			"ok": False,
 			"warnings": warnings_out,
 			"message": "No ROI could be fitted against uploaded spectrum.",
 		}
 
-	global_obj = np.full((n,), np.nan, dtype=np.float64)
-	global_obj[valid_global] = objective_acc[valid_global] / roi_acc[valid_global]
+	obj_mat = np.vstack(objective_rows).astype(np.float64)
+	mae_mat = np.vstack(mae_rows).astype(np.float64)
+	w = np.asarray(roi_weights, dtype=np.float64)
+	w[~np.isfinite(w)] = 0.0
+	w = np.clip(w, 0.0, np.inf)
+	if float(np.sum(w)) <= 0.0:
+		w = np.ones_like(w, dtype=np.float64)
+
+	global_obj = np.average(obj_mat, axis=0, weights=w).astype(np.float64)
 	best_global_idx = int(np.nanargmin(global_obj))
 
-	global_mae = np.full((n,), np.nan, dtype=np.float64)
-	global_mae[valid_global] = mae_acc[valid_global] / roi_acc[valid_global]
+	global_mae = np.average(mae_mat, axis=0, weights=w).astype(np.float64)
 
 	# Build global overlay using a single best parameter vector across all fitted ROIs
 	x_best = np.asarray(X[best_global_idx:best_global_idx + 1], dtype=np.float32)
@@ -2202,9 +2227,10 @@ def _run_roi_fitting(
 			"FWHM": float(X[best_global_idx, 3]),
 		},
 		"fit_criterion": str(crit),
+		"global_weight_mode": str(weight_mode),
 		"best_global_mean_objective": float(global_obj[best_global_idx]),
 		"best_global_mean_MAE": float(global_mae[best_global_idx]),
-		"n_rois_fitted": int(np.max(roi_acc)),
+		"n_rois_fitted": int(obj_mat.shape[0]),
 		"per_roi": per_roi_rows,
 		"plot_payload": best_plot_payload,
 		"global_overlay": global_overlay,
@@ -3806,6 +3832,21 @@ A remarkable upsurge in the complexity of molecules identified in the interstell
 				index=0,
 				key="p6_fit_criterion",
 			)
+			fit_weight_mode_ui = st.selectbox(
+				"Global aggregation weighting",
+				options=[
+					"Uniform (all ROIs equal)",
+					"By overlap points per ROI",
+					"By ROI fit quality (inverse best error)",
+				],
+				index=0,
+				key="p6_fit_weight_mode",
+			)
+			fit_weight_mode_map = {
+				"Uniform (all ROIs equal)": "uniform",
+				"By overlap points per ROI": "overlap_points",
+				"By ROI fit quality (inverse best error)": "inverse_best_error",
+			}
 			cfr1, cfr2, cfr3, cfr4 = st.columns(4)
 			with cfr1:
 				fit_logn_min = st.number_input("logN min", value=12.0, key="p6_fit_logn_min")
@@ -3859,6 +3900,7 @@ A remarkable upsurge in the complexity of molecules identified in the interstell
 						obs_intensity=np.asarray(obs_vals_fit_used, dtype=np.float64),
 						case_mode=str(fit_case_mode),
 						fit_criterion=str(fit_criterion_ui).strip().lower(),
+						global_weight_mode=str(fit_weight_mode_map.get(str(fit_weight_mode_ui), "uniform")),
 						n_candidates=int(n_candidates_fit),
 						ranges=ranges_fit,
 						noise_scale=float(noise_scale),
@@ -3888,7 +3930,8 @@ A remarkable upsurge in the complexity of molecules identified in the interstell
 				st.caption(
 					f"Mode: {fit_result.get('case_mode', '')} | "
 					f"Candidates: {int(fit_result.get('n_candidates', 0))} | "
-					f"ROIs fitted: {int(fit_result.get('n_rois_fitted', 0))}"
+					f"ROIs fitted: {int(fit_result.get('n_rois_fitted', 0))} | "
+					f"Weighting: {fit_result.get('global_weight_mode', 'uniform')}"
 				)
 
 				global_overlay = fit_result.get("global_overlay", [])
