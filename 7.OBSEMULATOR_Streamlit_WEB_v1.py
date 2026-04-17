@@ -2478,6 +2478,8 @@ def _ensure_state():
 		st.session_state.p6_fit_upload_signature = ""
 	if "p6_fit_sources_signature" not in st.session_state:
 		st.session_state.p6_fit_sources_signature = ""
+	if "p6_fit_candidate_mode_prev" not in st.session_state:
+		st.session_state.p6_fit_candidate_mode_prev = ""
 
 
 def _clear_fitting_outputs():
@@ -4039,6 +4041,12 @@ A remarkable upsurge in the complexity of molecules identified in the interstell
 				"Smart ordered grid": "ordered_grid",
 				"Random": "random",
 			}
+			curr_fit_mode = str(fit_candidate_mode_ui)
+			prev_fit_mode = str(st.session_state.get("p6_fit_candidate_mode_prev", ""))
+			if prev_fit_mode and (prev_fit_mode != curr_fit_mode):
+				_clear_fitting_outputs()
+				st.info("Candidate generation mode changed: previous fitting outputs were cleared.")
+			st.session_state.p6_fit_candidate_mode_prev = str(curr_fit_mode)
 			fit_weight_mode_ui = st.selectbox(
 				"Global aggregation weighting",
 				options=[
